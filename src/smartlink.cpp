@@ -400,7 +400,9 @@ void handle_dns(std::shared_ptr<Session> s, const SocksTarget& target) {
 }
 
 bool open_direct(std::shared_ptr<Session> s, const SocksTarget& t) {
-    socket_t remote_fd = tcp_connect(t.host, static_cast<int>(t.port), s->cfg.idle_timeout_sec);
+    // DNS-over-TCP: bypass activate_net's UDP/53 fake-IP hijack.
+    socket_t remote_fd =
+        tcp_connect_direct_host(t.host, static_cast<int>(t.port), s->cfg.idle_timeout_sec);
     if (remote_fd == INVALID_SOCK) return false;
     s->remote_fd = remote_fd;
     s->via_proxy = false;

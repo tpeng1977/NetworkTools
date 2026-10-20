@@ -281,9 +281,35 @@ void relay_proxy_down(std::shared_ptr<Session> s) {
     shutdown_both(s->remote_fd);
 }
 
+bool host_is_ipv4_literal(const std::string& host) {
+    in_addr a{};
+    return inet_pton(AF_INET, host.c_str(), &a) == 1;
+}
+
+// Rebuild Vortex CONNECT as ATYP_DOMAIN so the remote server resolves
+// (local / cached A records are often GFW-poisoned).
+void prefer_remote_dns_wire(SocksTarget& t, const std::string& domain) {
+    if (domain.empty() || domain.size() > 255) return;
+    if (host_is_ipv4_literal(domain)) return;
+    t.atyp = vortex::ATYP_DOMAIN;
+    t.host = domain;
+    t.has_ipv4 = false;
+    t.ipv4_host = 0;
+    t.wire.clear();
+    t.wire.push_back(vortex::ATYP_DOMAIN);
+    t.wire.push_back(static_cast<uint8_t>(domain.size()));
+    t.wire.insert(t.wire.end(), domain.begin(), domain.end());
+    t.wire.push_back(static_cast<uint8_t>(t.port >> 8));
+    t.wire.push_back(static_cast<uint8_t>(t.port & 0xFF));
+}
+
 bool open_proxy(std::shared_ptr<Session> s, const SocksTarget& t) {
     socket_t remote_fd = tcp_connect(s->link.server_ip, s->link.server_port, s->idle_timeout_sec);
-    if (remote_fd == INVALID_SOCK) return false;
+    if (remote_fd == INVALID_SOCK) {
+        log_line("[-] uplink TCP failed " + s->link.name + " " + s->link.server_ip + ":" +
+                 std::to_string(s->link.server_port));
+        return false;
+    }
     s->remote_fd = remote_fd;
     s->via_proxy = true;
 
@@ -297,10 +323,18 @@ bool open_proxy(std::shared_ptr<Session> s, const SocksTarget& t) {
 
     if (!vortex::send_frame(remote_fd, s->up, vortex::CMD_CONNECT,
                             t.wire, s->link.padding_min, s->link.padding_max)) {
+        log_line("[-] CONNECT send failed via " + s->link.name + " " + t.host + ":" +
+                 std::to_string(t.port));
         return false;
     }
     auto reply = vortex::recv_frame(remote_fd, s->down, s->link.max_payload);
-    return reply.ok && reply.cmd == vortex::CMD_CONNECT_OK;
+    if (!reply.ok || reply.cmd != vortex::CMD_CONNECT_OK) {
+        log_line("[-] CONNECT rejected via " + s->link.name + " " + t.host + ":" +
+                 std::to_string(t.port) +
+                 (reply.ok ? " cmd=" + std::to_string(reply.cmd) : " (frame)"));
+        return false;
+    }
+    return true;
 }
 
 bool dns_query_direct(const uint8_t* query, size_t qlen, std::vector<uint8_t>& answer) {
@@ -386,7 +420,8 @@ void handle_dns(std::shared_ptr<Session> s, const SocksTarget& target,
     if (!recv_exact(s->local_fd, query.data(), qlen)) return;
 
     const std::string name = dns_qname(query.data(), query.size());
-    const auto decision = g_rules.decide(name.empty() ? target.host : name, false, 0, true);
+    // Never locally resolve for matching — poisoned cache → wrong GEOIP,CN.
+    const auto decision = g_rules.decide(name.empty() ? target.host : name, false, 0, false);
 
     LinkEndpoint link;
     std::string link_err;
@@ -429,7 +464,9 @@ void handle_dns(std::shared_ptr<Session> s, const SocksTarget& target,
 }
 
 bool open_direct(std::shared_ptr<Session> s, const SocksTarget& t) {
-    socket_t remote_fd = tcp_connect(t.host, static_cast<int>(t.port), s->idle_timeout_sec);
+    // DNS-over-TCP: bypass activate_net's UDP/53 fake-IP hijack.
+    socket_t remote_fd =
+        tcp_connect_direct_host(t.host, static_cast<int>(t.port), s->idle_timeout_sec);
     if (remote_fd == INVALID_SOCK) return false;
     s->remote_fd = remote_fd;
     s->via_proxy = false;
@@ -455,13 +492,20 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
         return;
     }
 
+    // Prefer a learned domain over a (possibly poisoned) literal IP for rules.
     std::string rule_host = target.host;
+    bool has_ip = false;
+    uint32_t ip_host = 0;
     if (target.has_ipv4) {
         const std::string learned = cached_name(target.ipv4_host);
-        if (!learned.empty()) rule_host = learned;
+        if (!learned.empty()) {
+            rule_host = learned;
+        } else {
+            has_ip = true;
+            ip_host = target.ipv4_host;
+        }
     }
-    const auto decision = g_rules.decide(
-        rule_host, target.has_ipv4, target.ipv4_host, /*allow_dns_resolve=*/true);
+    const auto decision = g_rules.decide(rule_host, has_ip, ip_host, /*allow_dns_resolve=*/false);
 
     LinkEndpoint link;
     std::string link_err;
@@ -478,8 +522,9 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
 
     if (cfg.log_decisions) {
         log_line(std::string("[*] ") + rules::decision_name(decision) + " " +
-                 target.host + ":" + std::to_string(target.port) +
-                 "  (" + decision.matched + ")");
+                 rule_host + ":" + std::to_string(target.port) +
+                 "  (" + decision.matched + ")" +
+                 (link.name.empty() ? "" : " via " + link.name + " " + link.server_ip));
     }
 
     bool ok = false;
@@ -490,7 +535,12 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
             return;
         }
     } else {
-        ok = open_proxy(s, target);
+        // Non-DIRECT: always ask remote to resolve when we have a domain name.
+        SocksTarget connect_tgt = target;
+        if (!host_is_ipv4_literal(rule_host)) {
+            prefer_remote_dns_wire(connect_tgt, rule_host);
+        }
+        ok = open_proxy(s, connect_tgt);
         if (!ok) {
             reply_socks_fail(local_fd, 0x01);
             return;

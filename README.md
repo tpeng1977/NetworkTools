@@ -14,6 +14,7 @@ Supports **Linux**, **Windows**, and **macOS**.
 - SmartLink: rule-based SOCKS5 (`DIRECT` / single `PROXY`) using Clash-style rules
 - MultiLink: rule-based SOCKS5 with multiple named upstreams (`link1` / `link2` / `DIRECT`)
 - Local: plain SOCKS5 that always connects DIRECT (no tunnel; useful for tests)
+- ActivateNet: system-wide transparent proxy for **this PC’s apps** (WinDivert, fake-IP DNS → local SOCKS5 on multilink/smartlink — no SOCKS setting in apps)
 - AP2Socks5 + only-ap: Windows Mobile Hotspot clients → local SOCKS5 (WinDivert, fake-IP DNS)
 - Separate JSON configs for server, client, smartlink, multilink, local, ap2socks5, hotspot
 - Designed for long-running use (timeouts, keepalive, connection limits)
@@ -173,6 +174,34 @@ Outbound names in rules: `DIRECT`, `link1`, `link2`, … (must match keys under 
 ### Shared rule syntax
 
 Supported types: `IP-CIDR`, `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `GEOIP` (`private` / `CN`), `GEOSITE` (`cn`), `MATCH`. First match wins. `no-resolve` skips DNS when matching IP rules against a domain. SmartLink actions are `DIRECT` / `PROXY`; MultiLink actions are `DIRECT` / named link.
+
+## ActivateNet — this PC, no app proxy settings
+
+`activate_net.exe` captures **outbound** IPv4 TCP and DNS from local applications (WinDivert), answers DNS with fake-IP (`198.18.0.0/15`), terminates TCP locally, and relays each flow with **SOCKS5 CONNECT(domain)** to `multilink.exe` or `smartlink.exe` on `127.0.0.1:11080`. Routing (`DIRECT`, `link1`, `link2`, …) is handled entirely by the SOCKS5 upstream — not inside ActivateNet. Browsers and other apps need **no** SOCKS/HTTP proxy configuration.
+
+Does **not** bridge Mobile Hotspot / SoftAP (that remains `ap2socks5`).
+
+**Run two processes** (Administrator for ActivateNet):
+
+```bat
+REM 1) SOCKS5 with rules (normal user OK unless your setup needs admin)
+multilink.exe config\multilink.json
+REM or: smartlink.exe config\smartlink.json
+
+REM 2) Transparent capture (Administrator; WinDivert.dll + WinDivert64.sys next to exe)
+activate_net.exe config\activate_net.json
+```
+
+Config: `config/activate_net.json` (see `config_example/activate_net_example.json`), or pass `config/multilink.json` — ActivateNet reads `socks5_bind_ip` / `socks5_bind_port` from that file as the SOCKS5 endpoint.
+
+Behavior notes:
+
+- DNS: all **A** queries get **fake-IP** (`198.18.0.0/15`); TCP to fake-IP uses SOCKS5 CONNECT(domain)
+- **Only TCP to `198.18.0.0/15` is diverted** — real IPs (multilink/smartlink DIRECT and Vortex uplinks) are **not** captured
+- Outbound **UDP/443 (QUIC)**, **UDP/853 (DoT)**, and **IPv6** are dropped so apps fall back to IPv4 TCP through ActivateNet
+- Upstream SOCKS `DIRECT` resolves via **DNS-over-TCP** so fake-IP UDP hijack cannot loop
+
+Requires Administrator for `activate_net.exe`.
 
 ## Windows Mobile Hotspot
 

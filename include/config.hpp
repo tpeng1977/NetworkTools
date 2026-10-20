@@ -153,6 +153,40 @@ struct ClientConfig {
     }
 };
 
+// activate_net.exe — local-app transparent proxy → SOCKS5 on multilink/smartlink.
+struct ActivateNetConfig {
+    std::string socks5_host = "127.0.0.1";
+    int socks5_port = 11080;
+    int mss = 1200;
+    int idle_timeout_sec = 180;
+    int max_connections = 2048;
+    int max_dns_inflight = 64;
+    bool log_connections = true;
+
+    static ActivateNetConfig load(const std::string& path) {
+        JsonConfig j(path);
+        ActivateNetConfig c;
+        c.socks5_host = j.get_string("socks5_host", "");
+        if (c.socks5_host.empty()) {
+            c.socks5_host = j.get_string("socks5_bind_ip", "127.0.0.1");
+        }
+        int port = j.get_int("socks5_port", 0);
+        if (port <= 0) port = j.get_int("socks5_bind_port", 11080);
+        c.socks5_port = port;
+        c.mss = j.get_int("mss", c.mss);
+        c.idle_timeout_sec = j.get_int("idle_timeout_sec", c.idle_timeout_sec);
+        c.max_connections = j.get_int("max_connections", c.max_connections);
+        c.max_dns_inflight = j.get_int("max_dns_inflight", c.max_dns_inflight);
+        c.log_connections = j.get_bool("log_connections", c.log_connections);
+        if (c.mss < 200) c.mss = 200;
+        if (c.idle_timeout_sec < 1) c.idle_timeout_sec = 180;
+        if (c.max_connections < 1) c.max_connections = 2048;
+        if (c.max_dns_inflight < 1) c.max_dns_inflight = 64;
+        if (c.socks5_port < 1 || c.socks5_port > 65535) c.socks5_port = 11080;
+        return c;
+    }
+};
+
 // Plain local SOCKS5: CONNECT then direct TCP relay (no Vortex tunnel).
 struct LocalConfig {
     std::string socks5_bind_ip = "127.0.0.1";

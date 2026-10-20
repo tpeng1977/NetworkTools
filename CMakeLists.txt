@@ -58,6 +58,11 @@ if(WIN32)
   target_include_directories(ap2socks5 PRIVATE ${VORTEX_INCLUDE_DIR})
   vortex_link_platform(ap2socks5)
   target_link_libraries(ap2socks5 PRIVATE iphlpapi)
+
+  add_executable(activate_net src/activate_net.cpp)
+  target_include_directories(activate_net PRIVATE ${VORTEX_INCLUDE_DIR})
+  vortex_link_platform(activate_net)
+  target_link_libraries(activate_net PRIVATE iphlpapi)
 endif()
 
 enable_testing()

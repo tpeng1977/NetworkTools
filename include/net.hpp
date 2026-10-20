@@ -195,6 +195,124 @@ inline socket_t tcp_connect(const std::string& host, int port, int idle_timeout_
     return fd;
 }
 
+// DNS-over-TCP A lookup. Used when UDP/53 is hijacked by activate_net fake-IP
+// (getaddrinfo would return 198.18.x and DIRECT would loop back into SOCKS).
+inline bool resolve_ipv4_dns_tcp(const std::string& name, uint32_t& out_net,
+                                 const char* resolver = "8.8.8.8", int timeout_sec = 3) {
+    in_addr lit{};
+    if (inet_pton(AF_INET, name.c_str(), &lit) == 1) {
+        out_net = lit.s_addr;
+        return true;
+    }
+    if (name.empty() || name.size() > 253) return false;
+
+    std::vector<uint8_t> q;
+    q.push_back(0x12);
+    q.push_back(0x34);
+    q.push_back(0x01);
+    q.push_back(0x00);
+    q.push_back(0x00);
+    q.push_back(0x01);
+    q.push_back(0x00);
+    q.push_back(0x00);
+    q.push_back(0x00);
+    q.push_back(0x00);
+    q.push_back(0x00);
+    q.push_back(0x00);
+    size_t i = 0;
+    while (i < name.size()) {
+        size_t j = name.find('.', i);
+        if (j == std::string::npos) j = name.size();
+        const size_t lab = j - i;
+        if (lab == 0 || lab > 63) return false;
+        q.push_back(static_cast<uint8_t>(lab));
+        q.insert(q.end(), name.begin() + static_cast<std::ptrdiff_t>(i),
+                 name.begin() + static_cast<std::ptrdiff_t>(j));
+        i = j + (j < name.size() ? 1 : 0);
+    }
+    q.push_back(0);
+    q.push_back(0x00);
+    q.push_back(0x01);
+    q.push_back(0x00);
+    q.push_back(0x01);
+
+    socket_t fd = tcp_connect(resolver, 53, timeout_sec);
+    if (fd == INVALID_SOCK) {
+        fd = tcp_connect("1.1.1.1", 53, timeout_sec);
+        if (fd == INVALID_SOCK) return false;
+    }
+    uint8_t lenb[2] = {static_cast<uint8_t>(q.size() >> 8), static_cast<uint8_t>(q.size())};
+    if (!send_all(fd, lenb, 2) || !send_all(fd, q.data(), q.size())) {
+        net_close(fd);
+        return false;
+    }
+    uint8_t rlenb[2];
+    if (!recv_exact(fd, rlenb, 2)) {
+        net_close(fd);
+        return false;
+    }
+    const size_t rlen = (static_cast<size_t>(rlenb[0]) << 8) | rlenb[1];
+    if (rlen < 12 || rlen > 4096) {
+        net_close(fd);
+        return false;
+    }
+    std::vector<uint8_t> resp(rlen);
+    if (!recv_exact(fd, resp.data(), rlen)) {
+        net_close(fd);
+        return false;
+    }
+    net_close(fd);
+
+    auto skip_name = [&](size_t off) -> size_t {
+        int hops = 0;
+        while (off < resp.size() && hops < 64) {
+            const uint8_t lab = resp[off];
+            if (lab == 0) return off + 1;
+            if ((lab & 0xC0) == 0xC0) return off + 2 < resp.size() ? off + 2 : resp.size();
+            if (off + 1 + lab > resp.size()) return resp.size();
+            off += 1 + lab;
+            ++hops;
+        }
+        return resp.size();
+    };
+
+    const uint16_t ancount = static_cast<uint16_t>((resp[6] << 8) | resp[7]);
+    size_t off = skip_name(12);
+    if (off + 4 > resp.size()) return false;
+    off += 4;
+    for (uint16_t ai = 0; ai < ancount && off + 10 <= resp.size(); ++ai) {
+        off = skip_name(off);
+        if (off + 10 > resp.size()) return false;
+        const uint16_t typ = static_cast<uint16_t>((resp[off] << 8) | resp[off + 1]);
+        const uint16_t rdlen = static_cast<uint16_t>((resp[off + 8] << 8) | resp[off + 9]);
+        off += 10;
+        if (off + rdlen > resp.size()) return false;
+        if (typ == 1 && rdlen == 4) {
+            std::memcpy(&out_net, resp.data() + off, 4);
+            return out_net != 0;
+        }
+        off += rdlen;
+    }
+    return false;
+}
+
+// Prefer DNS-over-TCP when resolving hostnames so activate_net fake-IP UDP
+// hijack cannot poison DIRECT connects into 198.18.x loops.
+inline socket_t tcp_connect_direct_host(const std::string& host, int port, int idle_timeout_sec) {
+    in_addr lit{};
+    if (inet_pton(AF_INET, host.c_str(), &lit) == 1) {
+        return tcp_connect(host, port, idle_timeout_sec);
+    }
+    uint32_t ip_net = 0;
+    if (resolve_ipv4_dns_tcp(host, ip_net)) {
+        char buf[INET_ADDRSTRLEN] = {};
+        if (inet_ntop(AF_INET, &ip_net, buf, sizeof(buf))) {
+            return tcp_connect(buf, port, idle_timeout_sec);
+        }
+    }
+    return tcp_connect(host, port, idle_timeout_sec);
+}
+
 inline void shutdown_both(socket_t fd) {
     if (fd == INVALID_SOCK) return;
 #ifdef _WIN32

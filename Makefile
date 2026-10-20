@@ -31,7 +31,7 @@ endif
 
 all: server$(EXE) client$(EXE) smartlink$(EXE) multilink$(EXE) local$(EXE)
 ifeq ($(OS),Windows_NT)
-all: ap2socks5.exe
+all: ap2socks5.exe activate_net.exe
 endif
 
 help:
@@ -56,6 +56,9 @@ local$(EXE): src/local.cpp include/config.hpp include/net.hpp include/protocol.h
 ifeq ($(OS),Windows_NT)
 ap2socks5.exe: src/ap2socks5.cpp include/packet_build.hpp include/config.hpp
 	$(CXX) $(CXXFLAGS) src/ap2socks5.cpp -o $@ $(LDFLAGS) -liphlpapi
+
+activate_net.exe: src/activate_net.cpp include/packet_build.hpp include/config.hpp include/net.hpp
+	$(CXX) $(CXXFLAGS) src/activate_net.cpp -o $@ $(LDFLAGS) -liphlpapi
 endif
 
 tests/test_core$(EXE): tests/test_core.cpp include/*.hpp
@@ -74,7 +77,7 @@ test: tests/test_core$(EXE) tests/test_rules$(EXE) tests/test_multilink$(EXE) al
 
 clean:
 ifeq ($(OS),Windows_NT)
-	-@$(RM) server.exe client.exe smartlink.exe multilink.exe local.exe tests\test_core.exe tests\test_rules.exe tests\test_multilink.exe 2>$(NULL)
+	-@$(RM) server.exe client.exe smartlink.exe multilink.exe local.exe ap2socks5.exe activate_net.exe tests\test_core.exe tests\test_rules.exe tests\test_multilink.exe 2>$(NULL)
 else
 	$(RM) server client smartlink multilink local tests/test_core tests/test_rules tests/test_multilink
 	$(RM) tests/echo_server tests/socks5_http_get tests/probe_test

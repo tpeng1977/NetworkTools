@@ -46,6 +46,16 @@ if not errorlevel 1 (
 %CXX% %CXXFLAGS% src\ap2socks5.cpp %APRES% -o ap2socks5.exe %LDFLAGS% -liphlpapi
 if errorlevel 1 exit /b 1
 
+echo [BUILD] activate_net...
+set "ANRES="
+where windres >NUL 2>&1
+if not errorlevel 1 (
+  windres -I src src\activate_net.rc -O coff -o src\activate_net.res
+  if not errorlevel 1 set "ANRES=src\activate_net.res"
+)
+%CXX% %CXXFLAGS% src\activate_net.cpp %ANRES% -o activate_net.exe %LDFLAGS% -liphlpapi
+if errorlevel 1 exit /b 1
+
 if /I "%~1"=="test" goto build_test
 if /I "%~1"=="all" goto build_all
 goto done
@@ -75,6 +85,8 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 %CXX% %CXXFLAGS% tests\test_multilink.cpp -o tests\test_multilink.exe %LDFLAGS%
 if errorlevel 1 exit /b 1
+%CXX% %CXXFLAGS% tests\test_multirules.cpp -o tests\test_multirules.exe %LDFLAGS% -liphlpapi
+if errorlevel 1 exit /b 1
 echo [TEST] running unit tests...
 tests\test_core.exe
 if errorlevel 1 exit /b 1
@@ -83,6 +95,8 @@ if errorlevel 1 exit /b 1
 tests\test_rules.exe
 if errorlevel 1 exit /b 1
 tests\test_multilink.exe
+if errorlevel 1 exit /b 1
+tests\test_multirules.exe
 if errorlevel 1 exit /b 1
 
 :done
@@ -93,4 +107,5 @@ echo   smartlink.exe config\smartlink.json
 echo   multilink.exe config\multilink.json
 echo   local.exe config\local.json
 echo   ap2socks5.exe config\ap2socks5.json
+echo   activate_net.exe config\multilink.json
 endlocal
