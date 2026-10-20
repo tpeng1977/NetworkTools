@@ -42,18 +42,30 @@ function Get-JsonObject([string]$Path) {
 }
 
 function Find-ApAdapter([string]$Gateway) {
-    $hits = @()
-    Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($_.IPAddress -eq $Gateway) {
-            $hits += [pscustomobject]@{
-                InterfaceAlias = $_.InterfaceAlias
-                InterfaceIndex = $_.InterfaceIndex
-                IPAddress      = $_.IPAddress
-                PrefixLength   = $_.PrefixLength
-            }
-        }
+    # Always return an Objectarray{} — a single PSCustomObject from return/unwrap
+    # makes .Count mean "property count" or $null, so the wait loop never matches.
+    $addrs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.IPAddress -and
+            $_.IPAddress -notlike "127.*" -and
+            $_.IPAddress -notlike "169.254.*"
+        })
+    $hit = $null
+    if ($Gateway) {
+        $hit = $addrs | Where-Object { $_.IPAddress -eq $Gateway } | Select-Object -First 1
     }
-    return $hits
+    if (-not $hit) {
+        $hit = $addrs | Where-Object { $_.IPAddress -eq "192.168.137.1" } | Select-Object -First 1
+    }
+    if (-not $hit) { return @() }
+    return @(
+        [pscustomobject]@{
+            InterfaceAlias = $hit.InterfaceAlias
+            InterfaceIndex = $hit.InterfaceIndex
+            IPAddress      = $hit.IPAddress
+            PrefixLength   = $hit.PrefixLength
+        }
+    )
 }
 
 if ($Stop) {
@@ -92,12 +104,18 @@ if (Test-Path $next) {
 
 Write-Host "[*] wait for AP gateway $apGateway (start only-ap.bat first if needed)"
 $hit = $null
-for ($i = 0; $i -lt 30; $i++) {
-    $found = Find-ApAdapter $apGateway
-    if ($found.Count -ge 1) { $hit = $found[0]; break }
-    Start-Sleep -Seconds 1
+for ($i = 0; $i -lt 45; $i++) {
+    $found = @(Find-ApAdapter $apGateway)
+    if ($found.Count -ge 1) {
+        $hit = $found[0]
+        break
+    }
+    Start-Sleep -Milliseconds 500
 }
 if (-not $hit) {
+    Write-Host "[!] IPv4 adapters seen:"
+    Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Host ("    {0}  {1}/{2}" -f $_.InterfaceAlias, $_.IPAddress, $_.PrefixLength) }
     throw "AP gateway $apGateway not found. Run only-ap.bat first, then retry."
 }
 Write-Host "[*] AP adapter $($hit.InterfaceAlias) ifIndex=$($hit.InterfaceIndex) $($hit.IPAddress)/$($hit.PrefixLength)"
