@@ -1,0 +1,14 @@
+{
+  "ap_adapter": "auto",
+  "ap_gateway": "192.168.137.1",
+  "ap_prefix": 24,
+  "socks5_host": "127.0.0.1",
+  "socks5_port": 11080,
+  "dns_server": "1.1.1.1",
+  "dns_port": 53,
+  "capture_layer": "forward",
+  "mss": 1200,
+  "idle_timeout_sec": 180,
+  "max_connections": 1024,
+  "max_dns_inflight": 64
+}

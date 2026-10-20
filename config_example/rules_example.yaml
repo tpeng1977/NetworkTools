@@ -1,0 +1,30 @@
+rules:
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  
+  - DOMAIN-SUFFIX,google.com,PROXY
+  - DOMAIN-KEYWORD,github,PROXY
+  - DOMAIN,openai.com,PROXY
+
+  - DOMAIN-SUFFIX,bilibili.com,DIRECT
+  - DOMAIN-SUFFIX,baidu.com,DIRECT
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+  - DOMAIN-SUFFIX,ip138.com,DIRECT
+
+
+  - DOMAIN-SUFFIX,nature.com,DIRECT
+  - DOMAIN-SUFFIX,science.org,DIRECT
+  - DOMAIN-SUFFIX,sciencemag.org,DIRECT
+  - DOMAIN-SUFFIX,sciencedirect.com,DIRECT
+  - DOMAIN-SUFFIX,elsevier.com,DIRECT
+  - DOMAIN-SUFFIX,ieee.org,DIRECT
+  - DOMAIN-KEYWORD,ieeexplore,DIRECT
+  - DOMAIN-SUFFIX,springer.com,DIRECT
+  - DOMAIN-SUFFIX,springerlink.com,DIRECT
+
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - GEOSITE,cn,DIRECT
+
+  - MATCH,PROXY

@@ -1,0 +1,12 @@
+{
+  "socks5_bind_ip": "127.0.0.1",
+  "socks5_bind_port": 11080,
+  "server_ip": "1.2.3.4",
+  "server_port": 18880,
+  "master_secret": "password",
+  "padding_min": 8,
+  "padding_max": 64,
+  "listen_backlog": 128,
+  "idle_timeout_sec": 300,
+  "max_payload": 32768
+}

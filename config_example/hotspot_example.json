@@ -1,0 +1,11 @@
+{
+  "ssid": "MyAP",
+  "password": "password",
+  "band": "2.4",
+  "prefer_5ghz": false,
+  "bounce_radio": false,
+  "deprioritize_vpn": true,
+  "watch": true,
+  "ap_gateway": "192.168.137.1",
+  "ap_radio": "auto"
+}

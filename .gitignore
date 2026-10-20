@@ -1,0 +1,50 @@
+# Build outputs
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.dylib
+*.so
+*.res
+/server
+/client
+/smartlink
+/multilink
+/local
+/ap2socks5
+/ap2socks5.next.exe
+/ap2socks5.fakeip.cache
+/ap2socks5.out.log
+/ap2socks5.err.log
+/WinDivert.dll
+/WinDivert64.sys
+/WinDivert32.sys
+/third_party/
+/build/
+/cmake-build-*/
+
+# Test binaries / logs (keep *.cpp / *.sh / *.ps1)
+/tests/*.exe
+/tests/*.log
+/tests/*.err
+/tests/forceflush.txt
+/tests/cli.log
+/tests/cli.err
+/tests/srv.log
+/tests/srv.err
+/tests/echo.log
+/tests/echo.err
+
+# Local secrets / runtime config (use config_example/ as templates)
+/config/*.json
+/config/*.yaml
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db

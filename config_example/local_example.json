@@ -1,0 +1,4 @@
+{
+  "socks5_bind_ip": "127.0.0.1",
+  "socks5_bind_port": 1080
+}

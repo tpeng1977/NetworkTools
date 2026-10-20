@@ -1,0 +1,12 @@
+{
+  "bind_ip": "0.0.0.0",
+  "bind_port": 18881,
+  "master_secret": "password1",
+  "padding_min": 8,
+  "padding_max": 64,
+  "camouflage": true,
+  "listen_backlog": 128,
+  "idle_timeout_sec": 300,
+  "max_payload": 32768,
+  "max_connections": 2048
+}
