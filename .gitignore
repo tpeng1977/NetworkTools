@@ -18,6 +18,10 @@
 /ap2socks5.fakeip.cache
 /ap2socks5.out.log
 /ap2socks5.err.log
+/activate_net.out.log
+/activate_net.err.log
+/enable_net.out.log
+/enable_net.err.log
 /WinDivert.dll
 /WinDivert64.sys
 /WinDivert32.sys

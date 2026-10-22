@@ -1,0 +1,9 @@
+{
+  "socks5_host": "127.0.0.1",
+  "socks5_port": 11080,
+  "mss": 1200,
+  "idle_timeout_sec": 180,
+  "max_connections": 2048,
+  "max_dns_inflight": 64,
+  "log_connections": true
+}

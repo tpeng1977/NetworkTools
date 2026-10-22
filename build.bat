@@ -56,6 +56,16 @@ if not errorlevel 1 (
 %CXX% %CXXFLAGS% src\activate_net.cpp %ANRES% -o activate_net.exe %LDFLAGS% -liphlpapi
 if errorlevel 1 exit /b 1
 
+echo [BUILD] enable_net...
+set "ENRES="
+where windres >NUL 2>&1
+if not errorlevel 1 (
+  windres -I src src\enable_net.rc -O coff -o src\enable_net.res
+  if not errorlevel 1 set "ENRES=src\enable_net.res"
+)
+%CXX% %CXXFLAGS% src\enable_net.cpp %ENRES% -o enable_net.exe %LDFLAGS% -liphlpapi
+if errorlevel 1 exit /b 1
+
 if /I "%~1"=="test" goto build_test
 if /I "%~1"=="all" goto build_all
 goto done

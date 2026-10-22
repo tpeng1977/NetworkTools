@@ -15,8 +15,9 @@ Supports **Linux**, **Windows**, and **macOS**.
 - MultiLink: rule-based SOCKS5 with multiple named upstreams (`link1` / `link2` / `DIRECT`)
 - Local: plain SOCKS5 that always connects DIRECT (no tunnel; useful for tests)
 - ActivateNet: system-wide transparent proxy for **this PC’s apps** (WinDivert, fake-IP DNS → local SOCKS5 on multilink/smartlink — no SOCKS setting in apps)
+- EnableNet: same goal as ActivateNet with **redir-host** DNS (real A when unique; `198.18` stand-in on collision) → SOCKS5 CONNECT(domain)
 - AP2Socks5 + only-ap: Windows Mobile Hotspot clients → local SOCKS5 (WinDivert, fake-IP DNS)
-- Separate JSON configs for server, client, smartlink, multilink, local, ap2socks5, hotspot
+- Separate JSON configs for server, client, smartlink, multilink, local, activate_net, enable_net, ap2socks5, hotspot
 - Designed for long-running use (timeouts, keepalive, connection limits)
 
 ## Requirements
@@ -203,6 +204,40 @@ Behavior notes:
 
 Requires Administrator for `activate_net.exe`.
 
+## EnableNet — this PC, redir-host DNS (no fake-IP by default)
+
+`enable_net.exe` is the **redir-host** counterpart to ActivateNet: same WinDivert + local SOCKS5 stack, but DNS answers use a sticky **IP↔hostname** map instead of always allocating fake-IP.
+
+- Prefer a **real A** from local UDP DNS (fast CN CDN) when that IP is not already bound to another name
+- On CDN / GFW-poisoned **IP collision**, or when resolve fails, allocate a unique **`198.18.0.0/15` stand-in** (same pool as ActivateNet) so each hostname stays distinct
+- TCP to learned / stand-in IPs is terminated and relayed with **SOCKS5 CONNECT(domain) only** — never CONNECT by IP (poisoned A records like `www.google.com` → `185.45.5.x` would otherwise skip DOMAIN rules and fail upstream with `cmd=4`)
+- Other TCP (private, unknown public, multilink/smartlink uplink) is reinjected; UDP/443, UDP/853, and IPv6 are dropped like ActivateNet
+
+Does **not** bridge Mobile Hotspot / SoftAP (use `ap2socks5`).
+
+**Run two processes** (Administrator for EnableNet):
+
+```bat
+REM 1) SOCKS5 with rules first
+multilink.exe config\multilink.json
+
+REM 2) Transparent capture (Administrator; WinDivert.dll + WinDivert64.sys next to exe)
+enable_net.exe config\enable_net.json
+```
+
+Config: `config/enable_net.json` (see `config_example/enable_net_example.json`). Same keys as ActivateNet (`socks5_host` / `socks5_port`, `mss`, `idle_timeout_sec`, `max_connections`, `max_dns_inflight`, `log_connections`). Passing `config/multilink.json` also works — EnableNet reads `socks5_bind_ip` / `socks5_bind_port` as the upstream.
+
+| | ActivateNet | EnableNet |
+|---|-------------|-----------|
+| DNS to apps | Always fake-IP `198.18/15` | Real A when unique; `198.18` on collision / miss |
+| Diverted TCP | Only to `198.18/15` | To learned / stand-in IPs (mapping table) |
+| SOCKS CONNECT | Domain | Domain (never IP) |
+| Best when | Maximum isolation from poisoned DNS | Prefer real IPs / redir-host style |
+
+Requires Administrator for `enable_net.exe`. Start multilink/smartlink **before** EnableNet.
+
+Optional: `enable-ipv6.bat` (Administrator) re-enables the IPv6 stack binding on adapters if it was turned off; EnableNet itself still drops outbound IPv6 so apps stay on IPv4 TCP through the proxy.
+
 ## Windows Mobile Hotspot
 
 Typical stack (Administrator where noted):
@@ -284,10 +319,13 @@ src/local.cpp          Plain SOCKS5 (always DIRECT)
 src/smartlink.cpp      Rule-based SOCKS5 (DIRECT / PROXY)
 src/multilink.cpp      Rule-based SOCKS5 (DIRECT / link1 / link2 / …)
 src/ap2socks5.cpp      Windows AP → SOCKS5 (WinDivert, fake-IP DNS)
+src/activate_net.cpp   This PC → SOCKS5 (WinDivert, fake-IP DNS)
+src/enable_net.cpp     This PC → SOCKS5 (WinDivert, redir-host DNS)
 config/                Local JSON/YAML (gitignored) + geo/
 config_example/        Checked-in config templates
 only-ap.bat|.ps1       Mobile Hotspot only
 start-ap2socks5.bat|.ps1  Start/stop ap2socks5 (hotspot must already be up)
+enable-ipv6.bat        Re-enable ms_tcpip6 on adapters (Administrator)
 tests/                 Unit + integration tests
 build.sh / build.bat   Build scripts
 CMakeLists.txt / Makefile
