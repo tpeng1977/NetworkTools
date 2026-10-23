@@ -72,6 +72,11 @@ if(WIN32)
   target_include_directories(enable_net PRIVATE ${VORTEX_INCLUDE_DIR})
   vortex_link_platform(enable_net)
   target_link_libraries(enable_net PRIVATE iphlpapi)
+
+  add_executable(internet src/internet.cpp)
+  target_include_directories(internet PRIVATE ${VORTEX_INCLUDE_DIR})
+  vortex_link_platform(internet)
+  target_link_libraries(internet PRIVATE iphlpapi)
 endif()
 
 enable_testing()

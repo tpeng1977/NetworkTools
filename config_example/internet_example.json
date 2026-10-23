@@ -1,0 +1,39 @@
+{
+  "multilink": {
+    "link1": {
+      "server_ip": "1.2.3.4",
+      "server_port": 18881,
+      "master_secret": "password1",
+      "padding_min": 8,
+      "padding_max": 64,
+      "idle_timeout_sec": 300,
+      "max_payload": 32768
+    },
+    "link2": {
+      "server_ip": "1.2.3.5",
+      "server_port": 18882,
+      "master_secret": "password2",
+      "padding_min": 8,
+      "padding_max": 64,
+      "idle_timeout_sec": 300,
+      "max_payload": 32768
+    },
+    "link3": {
+      "server_ip": "127.0.0.1",
+      "server_port": 18888,
+      "master_secret": "VortexSecureNetwork2026_KeyMix",
+      "peer_secret": "test_peer_secret",
+      "padding_min": 8,
+      "padding_max": 64,
+      "idle_timeout_sec": 300,
+      "max_payload": 32768
+    }
+  },
+  "socks5_bind_ip": "127.0.0.1",
+  "socks5_bind_port": 1080,
+  "listen_backlog": 128,
+  "rules_path": "config/multirules.yaml",
+  "geoip_cn": "config/geo/geoip-cn.txt",
+  "geosite_cn": "config/geo/geosite-cn.txt",
+  "log_decisions": true
+}

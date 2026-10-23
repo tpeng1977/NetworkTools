@@ -511,4 +511,33 @@ inline MultilinkConfig MultilinkConfig::load(const std::string& path) {
     return c;
 }
 
+// Combined MultiLink + EnableNet (see src/internet.cpp). JSON is the same shape
+// as multilink.json (MultilinkConfig::load); optional divert-only keys overlay.
+struct InternetConfig {
+    MultilinkConfig multilink;
+    int divert_idle_timeout_sec = 180;
+    int mss = 1200;
+    int max_connections = 2048;
+    int max_dns_inflight = 64;
+    bool log_connections = true;
+
+    static InternetConfig load(const std::string& path) {
+        InternetConfig c;
+        c.multilink = MultilinkConfig::load(path);
+        JsonConfig j(path);
+        c.divert_idle_timeout_sec =
+            j.get_int("divert_idle_timeout_sec", c.divert_idle_timeout_sec);
+        c.mss = j.get_int("mss", c.mss);
+        c.max_connections = j.get_int("max_connections", c.max_connections);
+        c.max_dns_inflight = j.get_int("max_dns_inflight", c.max_dns_inflight);
+        c.log_connections = j.get_bool("log_connections", c.log_connections);
+
+        if (c.mss < 200) c.mss = 200;
+        if (c.divert_idle_timeout_sec < 1) c.divert_idle_timeout_sec = 180;
+        if (c.max_connections < 1) c.max_connections = 2048;
+        if (c.max_dns_inflight < 1) c.max_dns_inflight = 64;
+        return c;
+    }
+};
+
 #endif // VORTEX_CONFIG_HPP

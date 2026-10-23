@@ -17,8 +17,9 @@ Supports **Linux**, **Windows**, and **macOS**.
 - Local: plain SOCKS5 that always connects DIRECT (no tunnel; useful for tests)
 - ActivateNet: system-wide transparent proxy for **this PC’s apps** (WinDivert, fake-IP DNS → local SOCKS5 on multilink/smartlink — no SOCKS setting in apps)
 - EnableNet: same goal as ActivateNet with **redir-host** DNS (real A when unique; `198.18` stand-in on collision) → SOCKS5 CONNECT(domain)
+- **Internet** (`internet.exe`): MultiLink + EnableNet **in one process** — same `multilink.json` / rules; system apps need no proxy settings; in-process loopback SOCKS + self-port / all-uplink-IP exclusion
 - AP2Socks5 + only-ap: Windows Mobile Hotspot clients → local SOCKS5 (WinDivert, fake-IP DNS)
-- Separate JSON configs for server, client, smartlink, multilink, local, peer, activate_net, enable_net, ap2socks5, hotspot
+- Separate JSON configs for server, client, smartlink, multilink, local, peer, activate_net, enable_net, internet, ap2socks5, hotspot
 - Designed for long-running use (timeouts, keepalive, connection limits)
 
 ## Requirements
@@ -154,6 +155,8 @@ multilink.exe config\multilink.json
 
 On a multilink link, set `"peer_secret": "..."` to send `VIA_PEER` instead of a normal `CONNECT` (server then forwards to a matching peer).
 
+Idle / NAT notes: peer↔server control links use TCP keepalive (~60s) and peers re-HELLO after ~90s idle. If a pooled socket is half-dead, the server drops it on the next `VIA_PEER` and tries another worker — restarting only `peer` is enough; you should not need to restart `server`.
+
 ## SOCKS5 front ends (pick one)
 
 Only one process should bind `127.0.0.1:11080` at a time. Point browsers and `ap2socks5` at that port.
@@ -270,6 +273,35 @@ Requires Administrator for `enable_net.exe`. Start multilink/smartlink **before*
 
 Optional: `enable-ipv6.bat` (Administrator) re-enables the IPv6 stack binding on adapters if it was turned off; EnableNet itself still drops outbound IPv6 so apps stay on IPv4 TCP through the proxy.
 
+## Internet — MultiLink + EnableNet (one process)
+
+`internet.exe` embeds MultiLink (same rules / link1·link2·link3 / VIA_PEER as `multilink.exe`) and EnableNet (redir-host WinDivert) so **local apps need no SOCKS/HTTP proxy settings**.
+
+```
+Apps --(no proxy)--> WinDivert (DNS + learned-IP TCP)
+                          |
+                     loopback SOCKS 127.0.0.1:11080  (in-process MultiLink)
+                          |
+                     DIRECT / link1 / link2 / link3 (peer)
+```
+
+Self-exclusion (avoids divert capturing the router):
+
+- Divert filter is `outbound and not loopback` — SOCKS hops to `127.0.0.1` are never captured
+- Every Vortex / DIRECT / DNS-UDP socket registers its **local source port** before connect; those packets are reinjected
+- All configured multilink `server_ip` values are reinjected (uplinks)
+
+```bat
+REM Administrator; WinDivert.dll + WinDivert64.sys next to internet.exe
+REM Stop multilink.exe / enable_net.exe first (same SOCKS port + divert)
+REM Remote: server.exe (+ peer.exe for link3) must match secrets
+internet.exe config\internet.json
+```
+
+Config: `config/internet.json` — **same shape as `multilink.json`** (see `config_example/internet_example.json` / `multilink_example.json`). Optional divert overlays: `mss`, `max_connections`, `divert_idle_timeout_sec`, `max_dns_inflight`, `log_connections`.
+
+Prefer `internet.exe` over running `multilink` + `enable_net` as two processes.
+
 ## Windows Mobile Hotspot
 
 Typical stack (Administrator where noted):
@@ -354,6 +386,7 @@ src/peer.cpp           Peer exit node (VIA_PEER relay through server)
 src/ap2socks5.cpp      Windows AP → SOCKS5 (WinDivert, fake-IP DNS)
 src/activate_net.cpp   This PC → SOCKS5 (WinDivert, fake-IP DNS)
 src/enable_net.cpp     This PC → SOCKS5 (WinDivert, redir-host DNS)
+src/internet.cpp       MultiLink + EnableNet combined (self-excluding divert)
 config/                Local JSON/YAML (gitignored) + geo/
 config_example/        Checked-in config templates
 only-ap.bat|.ps1       Mobile Hotspot only

@@ -1,0 +1,20 @@
+{
+  "socks5_bind_port": 21081,
+  "server_ip": "127.0.0.1",
+  "server_port": 28888,
+  "master_secret": "VortexPeerRelayTestSecret",
+  "padding_min": 4,
+  "padding_max": 16,
+  "listen_backlog": 64,
+  "idle_timeout_sec": 60,
+  "divert_idle_timeout_sec": 60,
+  "max_payload": 32768,
+  "rules_path": "tests/internet_router_rules.yaml",
+  "geoip_cn": "config/geo/geoip-cn.txt",
+  "geosite_cn": "config/geo/geosite-cn.txt",
+  "log_decisions": true,
+  "mss": 1200,
+  "max_connections": 256,
+  "max_dns_inflight": 32,
+  "log_connections": true
+}

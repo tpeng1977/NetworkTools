@@ -1,0 +1,4 @@
+rules:
+  - DOMAIN-SUFFIX,localhost,PROXY
+  - DOMAIN,127.0.0.1,PROXY
+  - MATCH,PROXY

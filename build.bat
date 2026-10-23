@@ -70,6 +70,16 @@ if not errorlevel 1 (
 %CXX% %CXXFLAGS% src\enable_net.cpp %ENRES% -o enable_net.exe %LDFLAGS% -liphlpapi
 if errorlevel 1 exit /b 1
 
+echo [BUILD] internet...
+set "INRES="
+where windres >NUL 2>&1
+if not errorlevel 1 (
+  windres -I src src\internet.rc -O coff -o src\internet.res
+  if not errorlevel 1 set "INRES=src\internet.res"
+)
+%CXX% %CXXFLAGS% src\internet.cpp %INRES% -o internet.exe %LDFLAGS% -liphlpapi
+if errorlevel 1 exit /b 1
+
 if /I "%~1"=="test" goto build_test
 if /I "%~1"=="all" goto build_all
 goto done
@@ -127,4 +137,6 @@ echo   local.exe config\local.json
 echo   peer.exe config\peer.json
 echo   ap2socks5.exe config\ap2socks5.json
 echo   activate_net.exe config\multilink.json
+echo   enable_net.exe config\enable_net.json
+echo   internet.exe config\internet.json
 endlocal

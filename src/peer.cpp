@@ -8,6 +8,7 @@
 #include "net.hpp"
 #include "protocol.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -182,6 +183,7 @@ bool run_peer_session(const PeerConfig& cfg) {
         return false;
     }
     set_socket_options(fd, cfg.idle_timeout_sec);
+    set_tcp_keepalive(fd, 60, 10, 3);
 
     uint64_t salt = get_random_salt();
     uint8_t salt_buf[8];
@@ -210,9 +212,20 @@ bool run_peer_session(const PeerConfig& cfg) {
     std::cout << "[*] Peer registered secret_len=" << cfg.peer_secret.size() << std::endl;
     std::cout.flush();
 
+    // Idle job wait uses a shorter recv timeout so NAT/firewall drops are
+    // noticed and the worker re-registers, instead of leaving a zombie on the
+    // server until the process is restarted.
+    const int job_wait_sec =
+        cfg.idle_timeout_sec > 0 ? (std::min)(90, cfg.idle_timeout_sec) : 90;
+
     while (g_running) {
+        set_recv_timeout(fd, job_wait_sec);
         auto job = vortex::recv_frame(fd, s->from_server, cfg.max_payload);
-        if (!job.ok) return false;
+        set_recv_timeout(fd, cfg.idle_timeout_sec);
+        if (!job.ok) {
+            // Timeout or dead link → reconnect (fresh HELLO on server).
+            return false;
+        }
         if (job.cmd != vortex::CMD_CONNECT) {
             std::cerr << "[-] Peer expected CONNECT job, got cmd=" << static_cast<int>(job.cmd)
                       << "\n";
@@ -228,10 +241,10 @@ void worker_loop(PeerConfig cfg, int id) {
         const bool ok = run_peer_session(cfg);
         if (!g_running) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(cfg.reconnect_ms));
-        if (!ok) {
-            std::cout << "[*] Peer worker#" << id << " reconnecting...\n";
-            std::cout.flush();
-        }
+        // Idle refresh (~90s) and dead-link recovery both re-HELLO here.
+        std::cout << "[*] Peer worker#" << id
+                  << (ok ? " refresh" : " reconnect") << "...\n";
+        std::cout.flush();
     }
 }
 

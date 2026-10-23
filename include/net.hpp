@@ -13,6 +13,7 @@
 #  endif
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  include <mstcpip.h>
    using socket_t = SOCKET;
    constexpr socket_t INVALID_SOCK = INVALID_SOCKET;
    using socklen_type = int;
@@ -76,12 +77,45 @@ inline void set_recv_timeout(socket_t fd, int timeout_sec) {
 #endif
 }
 
+// Detect dead/NAT-dropped peer control links well before OS defaults (~2h on Windows).
+inline void set_tcp_keepalive(socket_t fd, int idle_sec = 60, int interval_sec = 10,
+                              int probe_count = 3) {
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&one), sizeof(one));
+#ifdef _WIN32
+    struct {
+        u_long onoff;
+        u_long keepalivetime;
+        u_long keepaliveinterval;
+    } ka{};
+    ka.onoff = 1;
+    ka.keepalivetime = static_cast<u_long>((idle_sec > 0 ? idle_sec : 60) * 1000UL);
+    ka.keepaliveinterval = static_cast<u_long>((interval_sec > 0 ? interval_sec : 10) * 1000UL);
+    DWORD bytes = 0;
+    WSAIoctl(fd, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &bytes, nullptr, nullptr);
+    (void)probe_count;
+#elif defined(__APPLE__)
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, reinterpret_cast<const char*>(&idle_sec),
+               sizeof(idle_sec));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, reinterpret_cast<const char*>(&interval_sec),
+               sizeof(interval_sec));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, reinterpret_cast<const char*>(&probe_count),
+               sizeof(probe_count));
+#else
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, reinterpret_cast<const char*>(&idle_sec),
+               sizeof(idle_sec));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, reinterpret_cast<const char*>(&interval_sec),
+               sizeof(interval_sec));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, reinterpret_cast<const char*>(&probe_count),
+               sizeof(probe_count));
+#endif
+}
+
 inline void set_socket_options(socket_t fd, int idle_timeout_sec) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&one), sizeof(one));
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
-               reinterpret_cast<const char*>(&one), sizeof(one));
+    set_tcp_keepalive(fd);
 #ifdef __APPLE__
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE,
                reinterpret_cast<const char*>(&one), sizeof(one));

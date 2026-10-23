@@ -242,55 +242,72 @@ bool handle_via_peer(std::shared_ptr<ServerSession>& s, const std::vector<uint8_
         return false;
     }
 
-    auto peer = acquire_peer(secret, 15000);
-    if (!peer) {
-        std::cout << "[-] No peer for secret (target " << host << ":" << port << ")\n";
+    // After long idle, NAT may leave half-dead sockets in the pool. Drop them
+    // quickly (short dispatch timeout) and try the next registered worker so a
+    // freshly restarted peer works without restarting the server.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(15000);
+    std::shared_ptr<PeerConn> peer;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+        const int wait_ms = left > 0 ? static_cast<int>(left) : 0;
+        peer = acquire_peer(secret, wait_ms);
+        if (!peer) break;
+
+        set_recv_timeout(peer->fd, 5); // fail fast on zombie control links
+        if (!vortex::send_frame(peer->fd, peer->down, vortex::CMD_CONNECT, target_wire,
+                                s->cfg.padding_min, s->cfg.padding_max)) {
+            std::cout << "[*] Drop dead peer (CONNECT send) target " << host << ":" << port
+                      << "\n";
+            std::cout.flush();
+            release_peer(peer, true);
+            peer.reset();
+            continue;
+        }
+
+        auto reply = vortex::recv_frame(peer->fd, peer->up, s->cfg.max_payload);
+        if (!reply.ok) {
+            std::cout << "[*] Drop dead peer (CONNECT reply) target " << host << ":" << port
+                      << "\n";
+            std::cout.flush();
+            release_peer(peer, true);
+            peer.reset();
+            continue;
+        }
+
+        set_recv_timeout(peer->fd, s->cfg.idle_timeout_sec);
+
+        if (reply.cmd != vortex::CMD_CONNECT_OK) {
+            // Target dial failed on peer; worker stays registered for the next job.
+            release_peer(peer, false);
+            peer.reset();
+            vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL,
+                               nullptr, 0, s->cfg.padding_min, s->cfg.padding_max);
+            return false;
+        }
+
+        s->peer = peer;
+        if (!vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_OK,
+                                nullptr, 0, s->cfg.padding_min, s->cfg.padding_max)) {
+            vortex::send_frame(peer->fd, peer->down, vortex::CMD_CLOSE, nullptr, 0,
+                               s->cfg.padding_min, s->cfg.padding_max);
+            release_peer(peer, true);
+            s->peer.reset();
+            return false;
+        }
+
+        std::cout << "[+] Via-peer " << host << ":" << port << std::endl;
         std::cout.flush();
-        vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL,
-                           nullptr, 0, s->cfg.padding_min, s->cfg.padding_max);
-        return false;
-    }
-    s->peer = peer;
-
-    if (!vortex::send_frame(peer->fd, peer->down, vortex::CMD_CONNECT, target_wire,
-                            s->cfg.padding_min, s->cfg.padding_max)) {
-        release_peer(peer, true);
-        s->peer.reset();
-        vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL,
-                           nullptr, 0, s->cfg.padding_min, s->cfg.padding_max);
-        return false;
+        return true;
     }
 
-    auto reply = vortex::recv_frame(peer->fd, peer->up, s->cfg.max_payload);
-    if (!reply.ok) {
-        release_peer(peer, true);
-        s->peer.reset();
-        vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL,
-                           nullptr, 0, s->cfg.padding_min, s->cfg.padding_max);
-        return false;
-    }
-    if (reply.cmd != vortex::CMD_CONNECT_OK) {
-        // Target dial failed on peer; worker stays registered for the next job.
-        release_peer(peer, false);
-        s->peer.reset();
-        vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL,
-                           nullptr, 0, s->cfg.padding_min, s->cfg.padding_max);
-        return false;
-    }
-
-    if (!vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_OK,
-                            nullptr, 0, s->cfg.padding_min, s->cfg.padding_max)) {
-        // Tear down the peer job so the worker can recover.
-        vortex::send_frame(peer->fd, peer->down, vortex::CMD_CLOSE, nullptr, 0,
-                           s->cfg.padding_min, s->cfg.padding_max);
-        release_peer(peer, true);
-        s->peer.reset();
-        return false;
-    }
-
-    std::cout << "[+] Via-peer " << host << ":" << port << std::endl;
+    std::cout << "[-] No peer for secret (target " << host << ":" << port << ")\n";
     std::cout.flush();
-    return true;
+    vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL,
+                       nullptr, 0, s->cfg.padding_min, s->cfg.padding_max);
+    return false;
 }
 
 void handle_peer_hello(socket_t fd, ServerConfig cfg, uint64_t salt,
@@ -320,6 +337,7 @@ void handle_peer_hello(socket_t fd, ServerConfig cfg, uint64_t salt,
         peer->down.seq = down_already.seq;
     }
 
+    set_tcp_keepalive(fd, 60, 10, 3);
     set_recv_timeout(fd, cfg.idle_timeout_sec);
 
     if (!vortex::send_frame(fd, peer->down, vortex::CMD_CONNECT_OK, nullptr, 0,
