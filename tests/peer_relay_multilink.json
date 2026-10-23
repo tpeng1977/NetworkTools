@@ -1,0 +1,21 @@
+{
+  "multilink": {
+    "link3": {
+      "server_ip": "127.0.0.1",
+      "server_port": 28888,
+      "master_secret": "VortexPeerRelayTestSecret",
+      "peer_secret": "peer_relay_test_secret",
+      "padding_min": 4,
+      "padding_max": 16,
+      "idle_timeout_sec": 60,
+      "max_payload": 32768
+    }
+  },
+  "socks5_bind_ip": "127.0.0.1",
+  "socks5_bind_port": 21080,
+  "listen_backlog": 64,
+  "rules_path": "tests/peer_relay_rules.yaml",
+  "geoip_cn": "config/geo/geoip-cn.txt",
+  "geosite_cn": "config/geo/geosite-cn.txt",
+  "log_decisions": true
+}

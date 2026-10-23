@@ -22,10 +22,34 @@ constexpr uint8_t CMD_DATA         = 0x02;
 constexpr uint8_t CMD_CONNECT_OK   = 0x03;
 constexpr uint8_t CMD_CONNECT_FAIL = 0x04;
 constexpr uint8_t CMD_CLOSE        = 0x05;
+// Peer relay: peer registers with server; client asks server to forward via peer.
+constexpr uint8_t CMD_PEER_HELLO   = 0x06; // peer→server: data = peer_secret
+constexpr uint8_t CMD_VIA_PEER     = 0x07; // client→server: [u8 len][secret][CONNECT target…]
 
 constexpr uint8_t ATYP_IPV4   = 0x01;
 constexpr uint8_t ATYP_DOMAIN = 0x03;
 constexpr uint8_t ATYP_IPV6   = 0x04;
+
+inline std::vector<uint8_t> build_via_peer_payload(const std::string& peer_secret,
+                                                   const std::vector<uint8_t>& target_wire) {
+    std::vector<uint8_t> out;
+    if (peer_secret.empty() || peer_secret.size() > 255 || target_wire.empty()) return out;
+    out.push_back(static_cast<uint8_t>(peer_secret.size()));
+    out.insert(out.end(), peer_secret.begin(), peer_secret.end());
+    out.insert(out.end(), target_wire.begin(), target_wire.end());
+    return out;
+}
+
+inline bool parse_via_peer_payload(const std::vector<uint8_t>& data,
+                                   std::string& peer_secret,
+                                   std::vector<uint8_t>& target_wire) {
+    if (data.empty()) return false;
+    const size_t n = data[0];
+    if (n == 0 || data.size() < 1 + n + 4) return false;
+    peer_secret.assign(reinterpret_cast<const char*>(data.data() + 1), n);
+    target_wire.assign(data.begin() + 1 + static_cast<std::ptrdiff_t>(n), data.end());
+    return !peer_secret.empty() && !target_wire.empty();
+}
 
 struct SessionCrypto {
     VortexCipher cipher;

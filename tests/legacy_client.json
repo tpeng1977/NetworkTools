@@ -1,0 +1,12 @@
+{
+  "socks5_bind_ip": "127.0.0.1",
+  "socks5_bind_port": 21081,
+  "server_ip": "127.0.0.1",
+  "server_port": 28889,
+  "master_secret": "VortexLegacyRegressionSecret",
+  "padding_min": 4,
+  "padding_max": 16,
+  "listen_backlog": 64,
+  "idle_timeout_sec": 60,
+  "max_payload": 32768
+}

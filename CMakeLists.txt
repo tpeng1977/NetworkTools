@@ -53,6 +53,10 @@ add_executable(local src/local.cpp)
 target_include_directories(local PRIVATE ${VORTEX_INCLUDE_DIR})
 vortex_link_platform(local)
 
+add_executable(peer src/peer.cpp)
+target_include_directories(peer PRIVATE ${VORTEX_INCLUDE_DIR})
+vortex_link_platform(peer)
+
 if(WIN32)
   add_executable(ap2socks5 src/ap2socks5.cpp)
   target_include_directories(ap2socks5 PRIVATE ${VORTEX_INCLUDE_DIR})
@@ -91,6 +95,11 @@ target_include_directories(test_multilink PRIVATE ${VORTEX_INCLUDE_DIR})
 vortex_link_platform(test_multilink)
 add_test(NAME test_multilink COMMAND test_multilink WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+add_executable(test_peer_protocol tests/test_peer_protocol.cpp)
+target_include_directories(test_peer_protocol PRIVATE ${VORTEX_INCLUDE_DIR})
+vortex_link_platform(test_peer_protocol)
+add_test(NAME test_peer_protocol COMMAND test_peer_protocol WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_executable(echo_server tests/echo_server.cpp)
 target_include_directories(echo_server PRIVATE ${VORTEX_INCLUDE_DIR})
 vortex_link_platform(echo_server)
@@ -115,7 +124,7 @@ add_executable(stress_test tests/stress_test.cpp)
 target_include_directories(stress_test PRIVATE ${VORTEX_INCLUDE_DIR})
 vortex_link_platform(stress_test)
 
-install(TARGETS server client smartlink multilink local RUNTIME DESTINATION bin)
+install(TARGETS server client smartlink multilink local peer RUNTIME DESTINATION bin)
 install(DIRECTORY config/ DESTINATION share/vortex-shield/config)
 
 message(STATUS "Vortex Shield ${PROJECT_VERSION} (${CMAKE_SYSTEM_NAME})")

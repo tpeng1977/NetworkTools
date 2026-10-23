@@ -1,0 +1,5 @@
+rules:
+  # Force localhost echo through Vortex (no peer_secret) — classic CONNECT path.
+  - IP-CIDR,127.0.0.1/32,link1,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - MATCH,link1

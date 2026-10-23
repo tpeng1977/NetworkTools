@@ -1,0 +1,13 @@
+{
+  "server_ip": "127.0.0.1",
+  "server_port": 18888,
+  "master_secret": "password1",
+  "peer_secret": "peer_secret",
+  "padding_min": 8,
+  "padding_max": 64,
+  "idle_timeout_sec": 300,
+  "max_payload": 32768,
+  "workers": 4,
+  "reconnect_ms": 2000
+}
+  

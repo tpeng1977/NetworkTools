@@ -1,0 +1,12 @@
+{
+  "server_ip": "127.0.0.1",
+  "server_port": 28888,
+  "master_secret": "VortexPeerRelayTestSecret",
+  "peer_secret": "peer_relay_test_secret",
+  "padding_min": 4,
+  "padding_max": 16,
+  "idle_timeout_sec": 60,
+  "max_payload": 32768,
+  "workers": 4,
+  "reconnect_ms": 500
+}

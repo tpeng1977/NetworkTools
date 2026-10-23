@@ -36,6 +36,10 @@ echo [BUILD] local...
 %CXX% %CXXFLAGS% src\local.cpp -o local.exe %LDFLAGS%
 if errorlevel 1 exit /b 1
 
+echo [BUILD] peer...
+%CXX% %CXXFLAGS% src\peer.cpp -o peer.exe %LDFLAGS%
+if errorlevel 1 exit /b 1
+
 echo [BUILD] ap2socks5...
 set "APRES="
 where windres >NUL 2>&1
@@ -97,6 +101,8 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 %CXX% %CXXFLAGS% tests\test_multirules.cpp -o tests\test_multirules.exe %LDFLAGS% -liphlpapi
 if errorlevel 1 exit /b 1
+%CXX% %CXXFLAGS% tests\test_peer_protocol.cpp -o tests\test_peer_protocol.exe %LDFLAGS%
+if errorlevel 1 exit /b 1
 echo [TEST] running unit tests...
 tests\test_core.exe
 if errorlevel 1 exit /b 1
@@ -108,6 +114,8 @@ tests\test_multilink.exe
 if errorlevel 1 exit /b 1
 tests\test_multirules.exe
 if errorlevel 1 exit /b 1
+tests\test_peer_protocol.exe
+if errorlevel 1 exit /b 1
 
 :done
 echo [BUILD] OK
@@ -116,6 +124,7 @@ echo   client.exe config\client.json
 echo   smartlink.exe config\smartlink.json
 echo   multilink.exe config\multilink.json
 echo   local.exe config\local.json
+echo   peer.exe config\peer.json
 echo   ap2socks5.exe config\ap2socks5.json
 echo   activate_net.exe config\multilink.json
 endlocal

@@ -13,11 +13,12 @@ Supports **Linux**, **Windows**, and **macOS**.
 - Local SOCKS5 client (IPv4 / domain / IPv6 CONNECT)
 - SmartLink: rule-based SOCKS5 (`DIRECT` / single `PROXY`) using Clash-style rules
 - MultiLink: rule-based SOCKS5 with multiple named upstreams (`link1` / `link2` / `DIRECT`)
+- Peer relay: `peer.exe` registers on `server`; multilink links with `peer_secret` use `VIA_PEER` (multilink → server → peer → target)
 - Local: plain SOCKS5 that always connects DIRECT (no tunnel; useful for tests)
 - ActivateNet: system-wide transparent proxy for **this PC’s apps** (WinDivert, fake-IP DNS → local SOCKS5 on multilink/smartlink — no SOCKS setting in apps)
 - EnableNet: same goal as ActivateNet with **redir-host** DNS (real A when unique; `198.18` stand-in on collision) → SOCKS5 CONNECT(domain)
 - AP2Socks5 + only-ap: Windows Mobile Hotspot clients → local SOCKS5 (WinDivert, fake-IP DNS)
-- Separate JSON configs for server, client, smartlink, multilink, local, activate_net, enable_net, ap2socks5, hotspot
+- Separate JSON configs for server, client, smartlink, multilink, local, peer, activate_net, enable_net, ap2socks5, hotspot
 - Designed for long-running use (timeouts, keepalive, connection limits)
 
 ## Requirements
@@ -123,6 +124,35 @@ Copy templates from `config_example/` into `config/` (local `config/*.json` and 
 | `idle_timeout_sec` | Socket idle timeout |
 | `max_payload` | Max plaintext payload per frame |
 
+### Peer relay (`peer.exe` + `peer_secret` on a multilink link)
+
+Exit node that dials into `server`, registers with `peer_secret`, and handles `CMD_VIA_PEER` jobs:
+
+```
+multilink (link with peer_secret) → server → peer → target
+```
+
+```bat
+REM 1) server (same master_secret)
+server.exe config\server.json
+
+REM 2) peer workers (same master_secret + peer_secret)
+peer.exe config\peer.json
+
+REM 3) multilink — link3 sets peer_secret (see config/multilink.json)
+multilink.exe config\multilink.json
+```
+
+| Key (`config/peer.json`) | Meaning |
+|--------------------------|---------|
+| `server_ip` / `server_port` | Vortex server to dial |
+| `master_secret` | Must match server |
+| `peer_secret` | Must match the multilink link’s `peer_secret` |
+| `workers` | Parallel registered sessions on the server |
+| `reconnect_ms` | Delay after a failed/dropped session |
+
+On a multilink link, set `"peer_secret": "..."` to send `VIA_PEER` instead of a normal `CONNECT` (server then forwards to a matching peer).
+
 ## SOCKS5 front ends (pick one)
 
 Only one process should bind `127.0.0.1:11080` at a time. Point browsers and `ap2socks5` at that port.
@@ -165,12 +195,13 @@ multilink.exe config\multilink.json
 | Key | Meaning |
 |-----|---------|
 | `multilink.<name>.*` | Per-link Vortex server (`server_ip`, `server_port`, `master_secret`, …) |
+| `multilink.<name>.peer_secret` | Optional. If set, this link sends `VIA_PEER` so `server` relays via a matching `peer.exe` |
 | `socks5_bind_ip` / `socks5_bind_port` | Local SOCKS5 listen address |
 | `rules_path` | Clash-style rules (default `config/multirules.yaml`) |
 | `geoip_cn` / `geosite_cn` | Geo lists |
 | `log_decisions` | Log each CONNECT / DNS decision |
 
-Outbound names in rules: `DIRECT`, `link1`, `link2`, … (must match keys under `multilink`).
+Outbound names in rules: `DIRECT`, `link1`, `link2`, `link3`, … (must match keys under `multilink`). Example templates: `config_example/multilink_example.json`, `config_example/peer_example.json`.
 
 ### Shared rule syntax
 
@@ -318,6 +349,7 @@ src/client.cpp         Local SOCKS5 client (always PROXY / one uplink)
 src/local.cpp          Plain SOCKS5 (always DIRECT)
 src/smartlink.cpp      Rule-based SOCKS5 (DIRECT / PROXY)
 src/multilink.cpp      Rule-based SOCKS5 (DIRECT / link1 / link2 / …)
+src/peer.cpp           Peer exit node (VIA_PEER relay through server)
 src/ap2socks5.cpp      Windows AP → SOCKS5 (WinDivert, fake-IP DNS)
 src/activate_net.cpp   This PC → SOCKS5 (WinDivert, fake-IP DNS)
 src/enable_net.cpp     This PC → SOCKS5 (WinDivert, redir-host DNS)
@@ -359,14 +391,19 @@ Covered scenarios:
 - Wrong shared secret rejection
 - Binary bidirectional echo
 - Concurrent stress traffic
+- Peer protocol helpers (`CMD_PEER_HELLO` / `CMD_VIA_PEER` packing)
 
 ## Protocol overview
 
-1. Client sends 8-byte random salt (plaintext).
+1. Client (or peer) sends 8-byte random salt (plaintext).
 2. Both sides derive directional ciphers from `master_secret` + salt.
 3. Framed traffic: encrypted length (2 bytes) + encrypted body  
    `[cmd][data_len][data][padding]`.
-4. First frame must be a valid `CONNECT`; otherwise the server camouflages as a web server.
+4. First authenticated frame may be:
+   - `CONNECT` (0x01) — normal client tunnel to a target
+   - `PEER_HELLO` (0x06) — peer registers with `peer_secret` and waits for jobs
+   - `VIA_PEER` (0x07) — client asks server to forward the CONNECT target through a matching peer
+5. Anything else gets active-probe camouflage (HTTP 404-style reply when enabled).
 
 ## License / disclaimer
 

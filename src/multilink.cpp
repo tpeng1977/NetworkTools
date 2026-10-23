@@ -321,15 +321,26 @@ bool open_proxy(std::shared_ptr<Session> s, const SocksTarget& t) {
     s->up.init(s->link.master_secret, salt);
     s->down.init(s->link.master_secret, salt ^ 0xA5A5A5A5A5A5A5A5ULL);
 
-    if (!vortex::send_frame(remote_fd, s->up, vortex::CMD_CONNECT,
-                            t.wire, s->link.padding_min, s->link.padding_max)) {
+    const bool via_peer = !s->link.peer_secret.empty();
+    if (via_peer) {
+        const auto payload = vortex::build_via_peer_payload(s->link.peer_secret, t.wire);
+        if (payload.empty() ||
+            !vortex::send_frame(remote_fd, s->up, vortex::CMD_VIA_PEER, payload,
+                                s->link.padding_min, s->link.padding_max)) {
+            log_line("[-] VIA_PEER send failed via " + s->link.name + " " + t.host + ":" +
+                     std::to_string(t.port));
+            return false;
+        }
+    } else if (!vortex::send_frame(remote_fd, s->up, vortex::CMD_CONNECT, t.wire,
+                                   s->link.padding_min, s->link.padding_max)) {
         log_line("[-] CONNECT send failed via " + s->link.name + " " + t.host + ":" +
                  std::to_string(t.port));
         return false;
     }
     auto reply = vortex::recv_frame(remote_fd, s->down, s->link.max_payload);
     if (!reply.ok || reply.cmd != vortex::CMD_CONNECT_OK) {
-        log_line("[-] CONNECT rejected via " + s->link.name + " " + t.host + ":" +
+        log_line(std::string("[-] ") + (via_peer ? "VIA_PEER" : "CONNECT") +
+                 " rejected via " + s->link.name + " " + t.host + ":" +
                  std::to_string(t.port) +
                  (reply.ok ? " cmd=" + std::to_string(reply.cmd) : " (frame)"));
         return false;
@@ -524,7 +535,10 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
         log_line(std::string("[*] ") + rules::decision_name(decision) + " " +
                  rule_host + ":" + std::to_string(target.port) +
                  "  (" + decision.matched + ")" +
-                 (link.name.empty() ? "" : " via " + link.name + " " + link.server_ip));
+                 (link.name.empty()
+                      ? ""
+                      : " via " + link.name + " " + link.server_ip +
+                            (link.peer_secret.empty() ? "" : " (peer)")));
     }
 
     bool ok = false;
@@ -615,6 +629,7 @@ int main(int argc, char* argv[]) {
         const auto& L = kv.second;
         std::cout << "[*] Link " << L.name << " -> " << L.server_ip << ":" << L.server_port
                   << "  padding=[" << L.padding_min << "," << L.padding_max << "]"
+                  << (L.peer_secret.empty() ? "" : "  peer-relay")
                   << std::endl;
     }
     std::cout << "[*] Default link " << cfg.default_link << std::endl;

@@ -24,15 +24,19 @@ int main() {
         return 1;
     }
 
-    expect(cfg.links.size() == 2, "two links loaded");
+    expect(cfg.links.size() == 3, "three links loaded");
     expect(cfg.default_link == "link1", "default link is link1");
     expect(cfg.socks5_bind_port == 11080, "socks5 bind port");
     expect(cfg.rules_path == "config/multirules.yaml", "rules path");
 
     const auto* l1 = cfg.find_link("link1");
     const auto* l2 = cfg.find_link("link2");
+    const auto* l3 = cfg.find_link("link3");
     expect(l1 && l1->server_ip == "69.194.11.7", "link1 upstream");
     expect(l2 && l2->server_ip == "38.47.99.237", "link2 upstream");
+    expect(l3 && l3->server_ip == "127.0.0.1", "link3 upstream");
+    expect(l3 && !l3->peer_secret.empty(), "link3 has peer_secret");
+    expect(l1 && l1->peer_secret.empty(), "link1 has no peer_secret");
     expect(cfg.find_link("proxy") == l1, "proxy alias -> default link1");
     expect(cfg.find_link("missing") == nullptr, "unknown link is null");
 
@@ -55,8 +59,8 @@ int main() {
            "github -> link1");
 
     auto d3 = eng.decide("www.test-ipv6.com", false, 0, false);
-    expect(d3.action == rules::Action::Proxy && d3.outbound == "link2",
-           "test-ipv6 -> link2");
+    expect(d3.action == rules::Action::Proxy && d3.outbound == "link3",
+           "test-ipv6 -> link3");
 
     auto d4 = eng.decide("api.bybit.com", false, 0, false);
     expect(d4.action == rules::Action::Proxy && d4.outbound == "link2",

@@ -1,0 +1,20 @@
+{
+  "multilink": {
+    "link1": {
+      "server_ip": "127.0.0.1",
+      "server_port": 28889,
+      "master_secret": "VortexLegacyRegressionSecret",
+      "padding_min": 4,
+      "padding_max": 16,
+      "idle_timeout_sec": 60,
+      "max_payload": 32768
+    }
+  },
+  "socks5_bind_ip": "127.0.0.1",
+  "socks5_bind_port": 21082,
+  "listen_backlog": 64,
+  "rules_path": "tests/legacy_multirules.yaml",
+  "geoip_cn": "config/geo/geoip-cn.txt",
+  "geosite_cn": "config/geo/geosite-cn.txt",
+  "log_decisions": true
+}

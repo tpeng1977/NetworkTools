@@ -258,10 +258,52 @@ struct LinkEndpoint {
     std::string server_ip = "127.0.0.1";
     int server_port = 18888;
     std::string master_secret = "VortexSecureNetwork2026_KeyMix";
+    // If set, CONNECT is sent as CMD_VIA_PEER so the server relays through a peer.
+    std::string peer_secret;
     int padding_min = 0;
     int padding_max = 128;
     int idle_timeout_sec = 300;
     int max_payload = 32768;
+};
+
+// peer.exe — dials into server, registers with peer_secret, exits traffic for VIA_PEER.
+struct PeerConfig {
+    std::string server_ip = "127.0.0.1";
+    int server_port = 18888;
+    std::string master_secret = "VortexSecureNetwork2026_KeyMix";
+    std::string peer_secret = "test_peer_secret";
+    int padding_min = 8;
+    int padding_max = 64;
+    int idle_timeout_sec = 300;
+    int max_payload = 32768;
+    int workers = 4; // parallel sessions registered on the server
+    int reconnect_ms = 2000;
+
+    static PeerConfig load(const std::string& path) {
+        JsonConfig j(path);
+        PeerConfig c;
+        c.server_ip = j.get_string("server_ip", c.server_ip);
+        c.server_port = j.get_int("server_port", c.server_port);
+        c.master_secret = j.get_string("master_secret", c.master_secret);
+        c.peer_secret = j.get_string("peer_secret", c.peer_secret);
+        c.padding_min = j.get_int("padding_min", c.padding_min);
+        c.padding_max = j.get_int("padding_max", c.padding_max);
+        c.idle_timeout_sec = j.get_int("idle_timeout_sec", c.idle_timeout_sec);
+        c.max_payload = j.get_int("max_payload", c.max_payload);
+        c.workers = j.get_int("workers", c.workers);
+        c.reconnect_ms = j.get_int("reconnect_ms", c.reconnect_ms);
+        if (c.padding_min < 0) c.padding_min = 0;
+        if (c.padding_max < c.padding_min) c.padding_max = c.padding_min;
+        if (c.max_payload < 1024) c.max_payload = 1024;
+        if (c.max_payload > 60000) c.max_payload = 60000;
+        if (c.workers < 1) c.workers = 1;
+        if (c.workers > 64) c.workers = 64;
+        if (c.reconnect_ms < 200) c.reconnect_ms = 200;
+        if (c.peer_secret.empty()) {
+            throw std::runtime_error("peer_secret must be non-empty");
+        }
+        return c;
+    }
 };
 
 struct MultilinkConfig {
@@ -396,6 +438,7 @@ private:
         e.server_ip = get_string_in(body, "server_ip", e.server_ip);
         e.server_port = get_int_in(body, "server_port", e.server_port);
         e.master_secret = get_string_in(body, "master_secret", e.master_secret);
+        e.peer_secret = get_string_in(body, "peer_secret", e.peer_secret);
         e.padding_min = get_int_in(body, "padding_min", e.padding_min);
         e.padding_max = get_int_in(body, "padding_max", e.padding_max);
         e.idle_timeout_sec = get_int_in(body, "idle_timeout_sec", e.idle_timeout_sec);

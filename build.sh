@@ -60,6 +60,8 @@ echo "[BUILD] multilink..."
 $CXX $CXXFLAGS src/multilink.cpp -o "multilink${EXE}" $LDFLAGS $SMART_LIBS
 echo "[BUILD] local..."
 $CXX $CXXFLAGS src/local.cpp -o "local${EXE}" $LDFLAGS
+echo "[BUILD] peer..."
+$CXX $CXXFLAGS src/peer.cpp -o "peer${EXE}" $LDFLAGS
 
 case "$uname_s" in
   MINGW*|MSYS*|CYGWIN*)
@@ -74,11 +76,13 @@ if [[ "${1:-}" == "test" || "${1:-}" == "all" ]]; then
   $CXX $CXXFLAGS tests/test_packet_build.cpp -o "tests/test_packet_build${EXE}"
   $CXX $CXXFLAGS tests/test_rules.cpp -o "tests/test_rules${EXE}" $LDFLAGS
   $CXX $CXXFLAGS tests/test_multilink.cpp -o "tests/test_multilink${EXE}" $LDFLAGS
+  $CXX $CXXFLAGS tests/test_peer_protocol.cpp -o "tests/test_peer_protocol${EXE}" $LDFLAGS
   echo "[TEST] running unit tests..."
   "./tests/test_core${EXE}"
   "./tests/test_packet_build${EXE}"
   "./tests/test_rules${EXE}"
   "./tests/test_multilink${EXE}"
+  "./tests/test_peer_protocol${EXE}"
 fi
 
 if [[ "${1:-}" == "all" ]]; then
