@@ -1,6 +1,7 @@
 // Peer: dials into Vortex server, registers with peer_secret, and exits traffic
 // for CMD_VIA_PEER sessions (multilink → server → peer → target).
 //
+// One TCP registration handles many sequential jobs (no reconnect per request).
 // Cross-platform. Config: config/peer.json
 
 #include "config.hpp"
@@ -23,22 +24,13 @@ std::atomic<bool> g_running{true};
 
 void on_signal(int) { g_running = false; }
 
-struct PeerJob {
+struct PeerSession {
     socket_t server_fd = INVALID_SOCK;
-    socket_t target_fd = INVALID_SOCK;
-    std::atomic<bool> alive{true};
     PeerConfig cfg;
-    // Same layout as client.cpp toward the server:
     vortex::SessionCrypto to_server;   // encrypt outbound to server (salt)
     vortex::SessionCrypto from_server; // decrypt inbound from server (salt^XOR)
 
-    ~PeerJob() {
-        alive = false;
-        if (target_fd != INVALID_SOCK) {
-            shutdown_both(target_fd);
-            net_close(target_fd);
-            target_fd = INVALID_SOCK;
-        }
+    ~PeerSession() {
         if (server_fd != INVALID_SOCK) {
             shutdown_both(server_fd);
             net_close(server_fd);
@@ -47,11 +39,17 @@ struct PeerJob {
     }
 };
 
-void relay_target_to_server(std::shared_ptr<PeerJob> s) {
+struct JobState {
+    socket_t target_fd = INVALID_SOCK;
+    std::atomic<bool> alive{true};
+    std::atomic<bool> close_sent{false};
+};
+
+void relay_target_to_server(std::shared_ptr<PeerSession> s, std::shared_ptr<JobState> job) {
     std::vector<uint8_t> buf(static_cast<size_t>(s->cfg.max_payload));
-    while (s->alive && g_running) {
-        if (s->target_fd == INVALID_SOCK) break;
-        const int n = recv_some(s->target_fd, buf.data(), buf.size());
+    while (job->alive && g_running) {
+        if (job->target_fd == INVALID_SOCK) break;
+        const int n = recv_some(job->target_fd, buf.data(), buf.size());
         if (n <= 0) break;
         if (!vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_DATA,
                                 buf.data(), static_cast<size_t>(n),
@@ -59,17 +57,24 @@ void relay_target_to_server(std::shared_ptr<PeerJob> s) {
             break;
         }
     }
-    s->alive = false;
-    shutdown_both(s->server_fd);
+    job->alive = false;
+    if (!job->close_sent.exchange(true)) {
+        vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_CLOSE, nullptr, 0,
+                           s->cfg.padding_min, s->cfg.padding_max);
+    }
+    if (job->target_fd != INVALID_SOCK) {
+        shutdown_both(job->target_fd);
+    }
 }
 
-bool handle_one_job(std::shared_ptr<PeerJob> s, const std::vector<uint8_t>& connect_data) {
+// Returns false only when the control session must die (I/O / protocol break).
+bool handle_one_job(std::shared_ptr<PeerSession> s, const std::vector<uint8_t>& connect_data) {
     std::string host;
     uint16_t port = 0;
     if (!vortex::parse_connect_target(connect_data, host, port)) {
         vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_CONNECT_FAIL,
                            nullptr, 0, s->cfg.padding_min, s->cfg.padding_max);
-        return false;
+        return true;
     }
 
     socket_t tfd = tcp_connect(host, static_cast<int>(port), s->cfg.idle_timeout_sec);
@@ -77,41 +82,98 @@ bool handle_one_job(std::shared_ptr<PeerJob> s, const std::vector<uint8_t>& conn
         vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_CONNECT_FAIL,
                            nullptr, 0, s->cfg.padding_min, s->cfg.padding_max);
         std::cout << "[-] Peer connect failed " << host << ":" << port << std::endl;
-        return false;
+        std::cout.flush();
+        return true;
     }
-    s->target_fd = tfd;
+
+    auto job = std::make_shared<JobState>();
+    job->target_fd = tfd;
 
     if (!vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_CONNECT_OK,
                             nullptr, 0, s->cfg.padding_min, s->cfg.padding_max)) {
+        net_close(tfd);
+        job->target_fd = INVALID_SOCK;
         return false;
     }
     std::cout << "[+] Peer exit " << host << ":" << port << std::endl;
     std::cout.flush();
 
-    std::thread(relay_target_to_server, s).detach();
+    std::thread up_relay(relay_target_to_server, s, job);
 
-    std::vector<uint8_t> buf(static_cast<size_t>(s->cfg.max_payload));
-    while (s->alive && g_running) {
+    bool control_ok = true;
+    bool got_server_close = false;
+    while (job->alive && g_running) {
+        // Poll so target-EOF (job->alive=false) can end the job without a
+        // server CLOSE, while still reading DATA/CLOSE from the server promptly.
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(s->server_fd, &rfds);
+        timeval tv{};
+        tv.tv_sec = 0;
+        tv.tv_usec = 50000;
+        const int sel =
+            ::select(static_cast<int>(s->server_fd) + 1, &rfds, nullptr, nullptr, &tv);
+        if (!job->alive) break;
+        if (sel < 0) {
+            control_ok = false;
+            break;
+        }
+        if (sel == 0) continue;
+
         auto frame = vortex::recv_frame(s->server_fd, s->from_server, s->cfg.max_payload);
-        if (!frame.ok) break;
+        if (!frame.ok) {
+            control_ok = false;
+            break;
+        }
         if (frame.cmd == vortex::CMD_DATA) {
             if (!frame.data.empty()) {
-                if (!send_all(s->target_fd, frame.data.data(), frame.data.size())) break;
+                if (!send_all(job->target_fd, frame.data.data(), frame.data.size())) {
+                    break;
+                }
             }
         } else if (frame.cmd == vortex::CMD_CLOSE) {
+            got_server_close = true;
             break;
         } else {
+            control_ok = false;
             break;
         }
     }
-    s->alive = false;
-    shutdown_both(s->target_fd);
-    shutdown_both(s->server_fd);
-    return true;
+
+    job->alive = false;
+    if (job->target_fd != INVALID_SOCK) {
+        shutdown_both(job->target_fd);
+    }
+    if (up_relay.joinable()) up_relay.join();
+    if (job->target_fd != INVALID_SOCK) {
+        net_close(job->target_fd);
+        job->target_fd = INVALID_SOCK;
+    }
+
+    // If the target closed first we already sent CLOSE. The server may still
+    // have in-flight DATA (client→server→peer) before its matching CLOSE.
+    // Drain DATA until CLOSE — treating DATA as fatal was killing workers
+    // ("got cmd=2") and emptying the pool under browser bursts.
+    if (control_ok && !got_server_close && g_running) {
+        set_recv_timeout(s->server_fd, 10);
+        for (;;) {
+            auto fin = vortex::recv_frame(s->server_fd, s->from_server, s->cfg.max_payload);
+            if (!fin.ok) {
+                set_recv_timeout(s->server_fd, s->cfg.idle_timeout_sec);
+                return false;
+            }
+            if (fin.cmd == vortex::CMD_CLOSE) break;
+            if (fin.cmd == vortex::CMD_DATA) continue; // discard late uplink bytes
+            std::cerr << "[-] Peer expected job-end CLOSE, got cmd="
+                      << static_cast<int>(fin.cmd) << "\n";
+            set_recv_timeout(s->server_fd, s->cfg.idle_timeout_sec);
+            return false;
+        }
+        set_recv_timeout(s->server_fd, s->cfg.idle_timeout_sec);
+    }
+    return control_ok;
 }
 
-// One long-lived worker: register, then accept sequential CONNECT jobs.
-// After each job the TCP session to the server ends; caller reconnects.
 bool run_peer_session(const PeerConfig& cfg) {
     socket_t fd = tcp_connect(cfg.server_ip, cfg.server_port, cfg.idle_timeout_sec);
     if (fd == INVALID_SOCK) {
@@ -129,7 +191,7 @@ bool run_peer_session(const PeerConfig& cfg) {
         return false;
     }
 
-    auto s = std::make_shared<PeerJob>();
+    auto s = std::make_shared<PeerSession>();
     s->server_fd = fd;
     s->cfg = cfg;
     s->to_server.init(cfg.master_secret, salt);
@@ -148,15 +210,16 @@ bool run_peer_session(const PeerConfig& cfg) {
     std::cout << "[*] Peer registered secret_len=" << cfg.peer_secret.size() << std::endl;
     std::cout.flush();
 
-    // Idle wait for a job (CONNECT). Long idle timeout already set.
-    auto job = vortex::recv_frame(fd, s->from_server, cfg.max_payload);
-    if (!job.ok) return false;
-    if (job.cmd != vortex::CMD_CONNECT) {
-        std::cerr << "[-] Peer expected CONNECT job, got cmd=" << static_cast<int>(job.cmd)
-                  << "\n";
-        return false;
+    while (g_running) {
+        auto job = vortex::recv_frame(fd, s->from_server, cfg.max_payload);
+        if (!job.ok) return false;
+        if (job.cmd != vortex::CMD_CONNECT) {
+            std::cerr << "[-] Peer expected CONNECT job, got cmd=" << static_cast<int>(job.cmd)
+                      << "\n";
+            return false;
+        }
+        if (!handle_one_job(s, job.data)) return false;
     }
-    handle_one_job(s, job.data);
     return true;
 }
 
@@ -164,15 +227,8 @@ void worker_loop(PeerConfig cfg, int id) {
     while (g_running) {
         const bool ok = run_peer_session(cfg);
         if (!g_running) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(cfg.reconnect_ms));
         if (!ok) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(cfg.reconnect_ms));
-        } else {
-            // Job finished; immediately reconnect for the next job.
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        if (ok) {
-            // quiet
-        } else {
             std::cout << "[*] Peer worker#" << id << " reconnecting...\n";
             std::cout.flush();
         }
@@ -208,7 +264,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[*] Vortex Peer → " << cfg.server_ip << ":" << cfg.server_port
               << "  workers=" << cfg.workers
               << "  padding=[" << cfg.padding_min << "," << cfg.padding_max << "]"
-              << std::endl;
+              << "  multi-job=on" << std::endl;
     std::cout.flush();
 
     std::vector<std::thread> threads;

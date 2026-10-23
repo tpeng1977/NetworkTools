@@ -276,8 +276,8 @@ struct PeerConfig {
     int padding_max = 64;
     int idle_timeout_sec = 300;
     int max_payload = 32768;
-    int workers = 4; // parallel sessions registered on the server
-    int reconnect_ms = 2000;
+    int workers = 64; // concurrent jobs (= browser parallel HTTPS); each reuses the TCP session
+    int reconnect_ms = 200;
 
     static PeerConfig load(const std::string& path) {
         JsonConfig j(path);
@@ -297,8 +297,8 @@ struct PeerConfig {
         if (c.max_payload < 1024) c.max_payload = 1024;
         if (c.max_payload > 60000) c.max_payload = 60000;
         if (c.workers < 1) c.workers = 1;
-        if (c.workers > 64) c.workers = 64;
-        if (c.reconnect_ms < 200) c.reconnect_ms = 200;
+        if (c.workers > 256) c.workers = 256;
+        if (c.reconnect_ms < 50) c.reconnect_ms = 50;
         if (c.peer_secret.empty()) {
             throw std::runtime_error("peer_secret must be non-empty");
         }

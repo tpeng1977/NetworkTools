@@ -89,15 +89,27 @@ std::shared_ptr<PeerConn> acquire_peer(const std::string& secret, int wait_ms) {
     return nullptr;
 }
 
-void release_peer(const std::shared_ptr<PeerConn>& p, bool /*drop*/) {
+// drop=false: job finished; return worker to the idle pool (multi-job reuse).
+// drop=true: control link broken; remove from pool (fd closed by PeerConn / hello).
+void release_peer(const std::shared_ptr<PeerConn>& p, bool drop) {
     if (!p) return;
-    {
-        std::lock_guard<std::mutex> lock(p->mu);
-        p->busy = false;
+    if (drop) {
+        p->alive = false;
+        {
+            std::lock_guard<std::mutex> lock(p->mu);
+            p->busy = false;
+        }
+        unregister_peer(p);
+        if (p->fd != INVALID_SOCK) {
+            shutdown_both(p->fd);
+        }
+    } else {
+        {
+            std::lock_guard<std::mutex> lock(p->mu);
+            p->busy = false;
+        }
+        g_peer_cv.notify_all();
     }
-    // Workers are one-shot: after a job (or failure) remove from the idle pool.
-    unregister_peer(p);
-    g_peer_cv.notify_all();
 }
 
 struct ServerSession {
@@ -152,10 +164,16 @@ void relay_target_to_client(std::shared_ptr<ServerSession> s) {
     shutdown_both(s->client_fd);
 }
 
+// Reads peer → client for one job. Does NOT close the peer control socket
+// (workers are multi-job). Sets s->alive=false when the job ends.
 void relay_peer_to_client(std::shared_ptr<ServerSession> s, std::shared_ptr<PeerConn> peer) {
     while (s->alive && peer->alive && g_running) {
         auto frame = vortex::recv_frame(peer->fd, peer->up, s->cfg.max_payload);
-        if (!frame.ok) break;
+        if (!frame.ok) {
+            // Control link died mid-job.
+            peer->alive = false;
+            break;
+        }
         if (frame.cmd == vortex::CMD_DATA) {
             if (!frame.data.empty()) {
                 if (!vortex::send_frame(s->client_fd, s->down, vortex::CMD_DATA,
@@ -168,11 +186,11 @@ void relay_peer_to_client(std::shared_ptr<ServerSession> s, std::shared_ptr<Peer
         } else if (frame.cmd == vortex::CMD_CONNECT_FAIL) {
             break;
         } else {
+            peer->alive = false;
             break;
         }
     }
     s->alive = false;
-    peer->alive = false;
     shutdown_both(s->client_fd);
 }
 
@@ -224,7 +242,7 @@ bool handle_via_peer(std::shared_ptr<ServerSession>& s, const std::vector<uint8_
         return false;
     }
 
-    auto peer = acquire_peer(secret, 8000);
+    auto peer = acquire_peer(secret, 15000);
     if (!peer) {
         std::cout << "[-] No peer for secret (target " << host << ":" << port << ")\n";
         std::cout.flush();
@@ -244,8 +262,16 @@ bool handle_via_peer(std::shared_ptr<ServerSession>& s, const std::vector<uint8_
     }
 
     auto reply = vortex::recv_frame(peer->fd, peer->up, s->cfg.max_payload);
-    if (!reply.ok || reply.cmd != vortex::CMD_CONNECT_OK) {
+    if (!reply.ok) {
         release_peer(peer, true);
+        s->peer.reset();
+        vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL,
+                           nullptr, 0, s->cfg.padding_min, s->cfg.padding_max);
+        return false;
+    }
+    if (reply.cmd != vortex::CMD_CONNECT_OK) {
+        // Target dial failed on peer; worker stays registered for the next job.
+        release_peer(peer, false);
         s->peer.reset();
         vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL,
                            nullptr, 0, s->cfg.padding_min, s->cfg.padding_max);
@@ -254,6 +280,9 @@ bool handle_via_peer(std::shared_ptr<ServerSession>& s, const std::vector<uint8_
 
     if (!vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_OK,
                             nullptr, 0, s->cfg.padding_min, s->cfg.padding_max)) {
+        // Tear down the peer job so the worker can recover.
+        vortex::send_frame(peer->fd, peer->down, vortex::CMD_CLOSE, nullptr, 0,
+                           s->cfg.padding_min, s->cfg.padding_max);
         release_peer(peer, true);
         s->peer.reset();
         return false;
@@ -261,7 +290,6 @@ bool handle_via_peer(std::shared_ptr<ServerSession>& s, const std::vector<uint8_
 
     std::cout << "[+] Via-peer " << host << ":" << port << std::endl;
     std::cout.flush();
-    std::thread(relay_peer_to_client, s, peer).detach();
     return true;
 }
 
@@ -313,8 +341,8 @@ void handle_peer_hello(socket_t fd, ServerConfig cfg, uint64_t salt,
               << std::endl;
     std::cout.flush();
 
-    // Idle until VIA_PEER acquires this worker (sets busy) or the peer drops.
-    // Do not read frames here — that would race the job handler.
+    // Stay registered across many jobs. While busy, job handler owns peer I/O.
+    // While idle, only detect EOF (do not consume frames — races the job path).
     while (g_running && peer->alive) {
         bool busy = false;
         {
@@ -322,13 +350,44 @@ void handle_peer_hello(socket_t fd, ServerConfig cfg, uint64_t salt,
             busy = peer->busy;
         }
         if (busy) {
-            // Job handler owns I/O until it marks !alive / release_peer.
             while (g_running && peer->alive) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                {
+                    std::lock_guard<std::mutex> lock(peer->mu);
+                    if (!peer->busy) break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
+            continue; // back to idle wait for the next job
+        }
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(peer->fd, &rfds);
+        timeval tv{};
+        tv.tv_sec = 0;
+        tv.tv_usec = 200000; // 200ms
+        const int sel = ::select(static_cast<int>(peer->fd) + 1, &rfds, nullptr, nullptr, &tv);
+        if (sel < 0) {
+            peer->alive = false;
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (sel == 0) continue;
+        {
+            std::lock_guard<std::mutex> lock(peer->mu);
+            if (peer->busy) continue;
+        }
+        char peek = 0;
+#ifdef _WIN32
+        const int n = ::recv(peer->fd, &peek, 1, MSG_PEEK);
+#else
+        const int n = static_cast<int>(::recv(peer->fd, &peek, 1, MSG_PEEK));
+#endif
+        if (n <= 0) {
+            peer->alive = false;
+            break;
+        }
+        // Data while idle: next CONNECT is about to be handled (busy soon).
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     unregister_peer(peer);
     std::cout << "[*] Peer offline secret_len=" << secret.size() << std::endl;
@@ -336,7 +395,6 @@ void handle_peer_hello(socket_t fd, ServerConfig cfg, uint64_t salt,
 }
 
 void handle_client(socket_t client_fd, ServerConfig cfg) {
-    SessionGuard guard(g_active_sessions);
     auto s = std::make_shared<ServerSession>();
     s->client_fd = client_fd;
     s->cfg = std::move(cfg);
@@ -364,13 +422,15 @@ void handle_client(socket_t client_fd, ServerConfig cfg) {
         return;
     }
 
-    // Peer registration path (does not count as a normal client relay).
+    // Peer registration: long-lived idle workers must NOT consume max_connections.
     if (first.cmd == vortex::CMD_PEER_HELLO) {
         // Transfer ownership of fd to peer handler; clear so destructor won't double-close.
         s->client_fd = INVALID_SOCK;
         handle_peer_hello(client_fd, s->cfg, salt, first.data, s->up, s->down);
         return;
     }
+
+    SessionGuard guard(g_active_sessions);
 
     if (first.cmd == vortex::CMD_CONNECT) {
         std::string host;
@@ -415,30 +475,60 @@ void handle_client(socket_t client_fd, ServerConfig cfg) {
         if (!handle_via_peer(s, first.data)) return;
 
         auto peer = s->peer;
+        std::atomic<bool> relay_done{false};
+        std::thread down_relay([s, peer, &relay_done]() {
+            relay_peer_to_client(s, peer);
+            relay_done.store(true);
+        });
+
+        bool peer_link_ok = true;
+        bool close_to_peer_sent = false;
         while (s->alive && g_running && peer && peer->alive) {
+            // Peer already ended the job (CLOSE seen by down-relay): stop uplink.
+            if (relay_done.load()) break;
             auto frame = vortex::recv_frame(client_fd, s->up, s->cfg.max_payload);
             if (!frame.ok) break;
             if (frame.cmd == vortex::CMD_DATA) {
+                if (relay_done.load()) break;
                 if (!frame.data.empty()) {
                     if (!vortex::send_frame(peer->fd, peer->down, vortex::CMD_DATA,
                                             frame.data, s->cfg.padding_min,
                                             s->cfg.padding_max)) {
+                        // Late write after peer began teardown is not a hard link death.
+                        if (relay_done.load()) break;
+                        peer_link_ok = false;
                         break;
                     }
                 }
             } else if (frame.cmd == vortex::CMD_CLOSE) {
                 vortex::send_frame(peer->fd, peer->down, vortex::CMD_CLOSE, nullptr, 0,
                                    s->cfg.padding_min, s->cfg.padding_max);
+                close_to_peer_sent = true;
                 break;
             } else {
+                peer_link_ok = false;
                 break;
             }
         }
+
+        // Always complete a CLOSE handshake with the peer before reuse:
+        // if the peer finished first it is waiting for our CLOSE; if we finished
+        // first the peer needs CLOSE to leave the job loop.
         s->alive = false;
+        if (peer && peer->alive && peer_link_ok && !close_to_peer_sent) {
+            vortex::send_frame(peer->fd, peer->down, vortex::CMD_CLOSE, nullptr, 0,
+                               s->cfg.padding_min, s->cfg.padding_max);
+            close_to_peer_sent = true;
+        }
+        if (down_relay.joinable()) down_relay.join();
+        (void)relay_done;
+
         if (peer) {
-            peer->alive = false;
-            shutdown_both(peer->fd);
-            release_peer(peer, true);
+            if (!peer_link_ok || !peer->alive) {
+                release_peer(peer, true);
+            } else {
+                release_peer(peer, false); // reuse worker for the next VIA_PEER
+            }
             s->peer.reset();
         }
         shutdown_both(client_fd);

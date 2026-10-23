@@ -126,7 +126,8 @@ Copy templates from `config_example/` into `config/` (local `config/*.json` and 
 
 ### Peer relay (`peer.exe` + `peer_secret` on a multilink link)
 
-Exit node that dials into `server`, registers with `peer_secret`, and handles `CMD_VIA_PEER` jobs:
+Exit node that dials into `server`, registers with `peer_secret`, and handles `CMD_VIA_PEER` jobs.
+Each registered worker accepts **many sequential jobs** on one TCP session (no reconnect per request):
 
 ```
 multilink (link with peer_secret) → server → peer → target
@@ -148,8 +149,8 @@ multilink.exe config\multilink.json
 | `server_ip` / `server_port` | Vortex server to dial |
 | `master_secret` | Must match server |
 | `peer_secret` | Must match the multilink link’s `peer_secret` |
-| `workers` | Parallel registered sessions on the server |
-| `reconnect_ms` | Delay after a failed/dropped session |
+| `workers` | Parallel registered sessions (each handles many jobs; raise if sites open many concurrent HTTPS) |
+| `reconnect_ms` | Delay after a control-session drop before re-HELLO |
 
 On a multilink link, set `"peer_secret": "..."` to send `VIA_PEER` instead of a normal `CONNECT` (server then forwards to a matching peer).
 
@@ -392,6 +393,10 @@ Covered scenarios:
 - Binary bidirectional echo
 - Concurrent stress traffic
 - Peer protocol helpers (`CMD_PEER_HELLO` / `CMD_VIA_PEER` packing)
+- Local peer relay stack (no remote hosts): `powershell -File tests/run_peer_relay.ps1`
+  (HTTP DOMAIN/IPv4 via peer, `localhost` resolution on peer, DNS-over-TCP via peer, burst + parallel)
+- 5-minute high-intensity peer stress: `powershell -File tests/run_peer_stress_5min.ps1`
+  (12 threads × 300s; mixed HTTP/DNS via peer; requires `fail=0`)
 
 ## Protocol overview
 

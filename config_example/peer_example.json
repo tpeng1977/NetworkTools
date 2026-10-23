@@ -7,7 +7,7 @@
   "padding_max": 64,
   "idle_timeout_sec": 300,
   "max_payload": 32768,
-  "workers": 4,
-  "reconnect_ms": 2000
+  "workers": 64,
+  "reconnect_ms": 200
 }
   
