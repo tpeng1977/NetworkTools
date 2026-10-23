@@ -302,6 +302,30 @@ Config: `config/internet.json` — **same shape as `multilink.json`** (see `conf
 
 Prefer `internet.exe` over running `multilink` + `enable_net` as two processes.
 
+### Windows service (Win10/11)
+
+From the **repo root**, one command stages a self-contained payload into **`dist\VortexInternet\`** (gitignored — the folder appears only after this runs):
+
+```bat
+internet-service.bat stage
+```
+
+That copies `internet.exe`, WinDivert, `config\internet.json` + rules/geo, and control scripts into `dist\VortexInternet\` (and removes any legacy `VortexInternet.*` / `logs\` left in the repo root by older installs).
+
+Register / control the delayed auto-start service `VortexInternet` (WinSW wrapper; Administrator; auto-elevates):
+
+```bat
+internet-service.bat install
+internet-service.bat start
+internet-service.bat stop
+internet-service.bat restart
+internet-service.bat status
+internet-service.bat uninstall
+internet-service.bat uninstall -Purge
+```
+
+`install` runs `stage` first, then registers the service with working directory `dist\VortexInternet\`. Same actions via `.\internet-service.ps1 <action>`. After rebuilding `internet.exe`, re-run `stage` or `install` to refresh `dist\`. Offline: place [WinSW-x64.exe](https://github.com/winsw/winsw/releases) at `tools\WinSW-x64.exe` and use `-Offline`.
+
 ## Windows Mobile Hotspot
 
 Typical stack (Administrator where noted):
@@ -389,6 +413,8 @@ src/enable_net.cpp     This PC → SOCKS5 (WinDivert, redir-host DNS)
 src/internet.cpp       MultiLink + EnableNet combined (self-excluding divert)
 config/                Local JSON/YAML (gitignored) + geo/
 config_example/        Checked-in config templates
+dist/                  Runtime install tree (gitignored; from internet-service stage)
+internet-service.bat|.ps1  Stage dist\VortexInternet + Windows service control
 only-ap.bat|.ps1       Mobile Hotspot only
 start-ap2socks5.bat|.ps1  Start/stop ap2socks5 (hotspot must already be up)
 enable-ipv6.bat        Re-enable ms_tcpip6 on adapters (Administrator)

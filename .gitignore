@@ -25,6 +25,7 @@
 /WinDivert.dll
 /WinDivert64.sys
 /WinDivert32.sys
+/dist/
 /third_party/
 /build/
 /cmake-build-*/
