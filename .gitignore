@@ -46,6 +46,23 @@
 /config/*.json
 /config/*.yaml
 
+# Synced by build-android.bat from local config/ (secrets + large geo)
+/src/android/app/src/main/assets/internet.json
+/src/android/app/src/main/assets/rules.yaml
+/src/android/app/src/main/assets/geo/
+
+# Android Gradle local / caches / outputs
+/src/android/local.properties
+/src/android/.gradle/
+/src/android/**/build/
+/src/android/.idea/
+
+# Runtime logs
+/logs/
+
+# Accidental Windows NUL device dump
+/NUL
+
 # IDE / OS
 .vs/
 .vscode/

@@ -326,6 +326,18 @@ internet-service.bat uninstall -Purge
 
 `install` runs `stage` first, then registers the service with working directory `dist\VortexInternet\`. Same actions via `.\internet-service.ps1 <action>`. After rebuilding `internet.exe`, re-run `stage` or `install` to refresh `dist\`. Offline: place [WinSW-x64.exe](https://github.com/winsw/winsw/releases) at `tools\WinSW-x64.exe` and use `-Offline`.
 
+## Android VPN (VpnService)
+
+Source: `src/android/` — MultiLink + redir-host DNS over Android **VpnService** (desktop `internet.exe` equivalent; no per-app proxy). Config assets mirror `internet.json` / rules.
+
+One-command APK (needs **JDK 17+** and **Android SDK** / Android Studio; set `JAVA_HOME` / `ANDROID_HOME` if needed):
+
+```bat
+build-android.bat
+```
+
+Output: `dist\VortexInternetAndroid\vortex-internet.apk` (gitignored). Install with `adb install -r dist\VortexInternetAndroid\vortex-internet.apk`. Details: `src/android/README.md`.
+
 ## Windows Mobile Hotspot
 
 Typical stack (Administrator where noted):
@@ -411,10 +423,12 @@ src/ap2socks5.cpp      Windows AP → SOCKS5 (WinDivert, fake-IP DNS)
 src/activate_net.cpp   This PC → SOCKS5 (WinDivert, fake-IP DNS)
 src/enable_net.cpp     This PC → SOCKS5 (WinDivert, redir-host DNS)
 src/internet.cpp       MultiLink + EnableNet combined (self-excluding divert)
+src/android/           Android VpnService client (Gradle; see src/android/README.md)
 config/                Local JSON/YAML (gitignored) + geo/
 config_example/        Checked-in config templates
-dist/                  Runtime install tree (gitignored; from internet-service stage)
+dist/                  Runtime install tree (gitignored; internet service / Android APK)
 internet-service.bat|.ps1  Stage dist\VortexInternet + Windows service control
+build-android.bat      Build Android APK → dist\VortexInternetAndroid\
 only-ap.bat|.ps1       Mobile Hotspot only
 start-ap2socks5.bat|.ps1  Start/stop ap2socks5 (hotspot must already be up)
 enable-ipv6.bat        Re-enable ms_tcpip6 on adapters (Administrator)

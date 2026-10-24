@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vortex Internet</string>
+    <string name="vpn_notification_title">Vortex Internet</string>
+    <string name="vpn_notification_text">Transparent MultiLink VPN is running</string>
+    <string name="btn_start">Start VPN</string>
+    <string name="btn_stop">Stop VPN</string>
+    <string name="status_idle">Idle</string>
+    <string name="status_running">VPN running</string>
+    <string name="hint">配置与桌面 internet.json 同形。使用前请关闭系统「私人 DNS」，否则 DoT 会被丢弃导致无法解析。</string>
+</resources>
