@@ -49,17 +49,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# When invoked from a copy under dist\, treat that folder as DistDir and walk
-# up to find the repo (parent of dist\) for rebuild sources.
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = $ScriptDir
-if ((Split-Path -Leaf $ScriptDir) -eq "VortexInternet" -and
-    (Split-Path -Leaf (Split-Path -Parent $ScriptDir)) -eq "dist") {
-    $RepoRoot = Split-Path -Parent (Split-Path -Parent $ScriptDir)
+# Always derive paths from this script's location (repo root or dist\VortexInternet copy).
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$ScriptDir = [IO.Path]::GetFullPath($ScriptDir)
+$underDist = ((Split-Path -Leaf $ScriptDir) -eq "VortexInternet" -and
+    (Split-Path -Leaf (Split-Path -Parent $ScriptDir)) -eq "dist")
+if ($underDist) {
+    $RepoRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $ScriptDir)))
+    if (-not $DistDir) { $DistDir = $ScriptDir }
+} else {
+    $RepoRoot = $ScriptDir
+    if (-not $DistDir) { $DistDir = Join-Path $RepoRoot "dist\VortexInternet" }
 }
-if (-not $DistDir) {
-    $DistDir = Join-Path $RepoRoot "dist\VortexInternet"
-}
+$DistDir = [IO.Path]::GetFullPath($DistDir)
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -91,6 +93,71 @@ $DistConfigRel = "config\internet.json"
 
 function Get-ServiceObj {
     Get-Service -Name $ServiceId -ErrorAction SilentlyContinue
+}
+
+function Normalize-ExePath([string]$PathText) {
+    if ([string]::IsNullOrWhiteSpace($PathText)) { return "" }
+    $p = $PathText.Trim().Trim('"')
+    # ImagePath may be `"C:\...\VortexInternet.exe"` or with trailing args.
+    if ($p -match '(?i)^(.+?\.exe)(?:\s|$)') {
+        $p = $Matches[1].Trim('"')
+    }
+    try {
+        return [IO.Path]::GetFullPath($p)
+    } catch {
+        return $p
+    }
+}
+
+function Get-RegisteredImagePath {
+    $cim = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceId'" -ErrorAction SilentlyContinue
+    if ($cim -and $cim.PathName) { return [string]$cim.PathName }
+    $reg = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceId" -Name ImagePath -ErrorAction SilentlyContinue
+    if ($reg) { return [string]$reg.ImagePath }
+    return ""
+}
+
+# Point SCM ImagePath + WinSW xml at DistDir derived from this script.
+# Returns $true if ImagePath was changed.
+function Repair-ServiceBinding {
+    $svc = Get-ServiceObj
+    if (-not $svc) { return $false }
+    if (-not (Test-Path -LiteralPath $WrapperExe)) {
+        throw "Wrapper missing: $WrapperExe (from script at $ScriptDir). Run: .\internet-service.ps1 install"
+    }
+
+    # Keep WinSW xml executable/workingdirectory/logpath in sync with script location.
+    Write-WrapperXml
+
+    $want = Normalize-ExePath $WrapperExe
+    $registeredRaw = Get-RegisteredImagePath
+    $have = Normalize-ExePath $registeredRaw
+    if ($have -and ($have -ieq $want)) {
+        return $false
+    }
+
+    if (-not (Test-Admin)) {
+        throw @"
+Service ImagePath is stale (does not match this script's location).
+  registered: $registeredRaw
+  expected:   $WrapperExe
+Re-run start/install (auto-elevates) or open an Administrator console.
+"@
+    }
+
+    Write-Host "[*] auto-fix service path from script location"
+    Write-Host "    script: $ScriptDir"
+    Write-Host "    was:    $registeredRaw"
+    Write-Host "    now:    $WrapperExe"
+    & sc.exe config $ServiceId binPath= "`"$WrapperExe`"" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "sc.exe config failed (exit $LASTEXITCODE)"
+    }
+    $after = Normalize-ExePath (Get-RegisteredImagePath)
+    if (-not ($after -ieq $want)) {
+        throw "ImagePath repair did not stick (still: $(Get-RegisteredImagePath))"
+    }
+    return $true
 }
 
 function Resolve-SourceConfig {
@@ -305,7 +372,11 @@ function Install-InternetService {
             if ($LASTEXITCODE -ne 0) { throw "WinSW install failed (exit $LASTEXITCODE)" }
             Write-Host "[+] installed service $ServiceId"
         } else {
-            Write-Host "[*] service entry exists; refreshed files under $DistDir"
+            if (Repair-ServiceBinding) {
+                Write-Host "[+] service path repaired → $WrapperExe"
+            } else {
+                Write-Host "[*] service entry exists; refreshed files under $DistDir"
+            }
         }
     } finally {
         Pop-Location
@@ -367,6 +438,9 @@ function Start-InternetService {
     $svc = Get-ServiceObj
     if (-not $svc) { throw "Service $ServiceId is not installed. Run: .\internet-service.ps1 install" }
 
+    # Repo moved / legacy root install: rewrite ImagePath + xml from this script's DistDir.
+    [void](Repair-ServiceBinding)
+
     foreach ($name in @("internet", "enable_net", "multilink", "smartlink", "activate_net")) {
         Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
             Write-Host "[!] stopping conflicting process $($_.ProcessName) pid=$($_.Id)"
@@ -374,6 +448,7 @@ function Start-InternetService {
         }
     }
 
+    $svc = Get-ServiceObj
     if ($svc.Status -eq "Running") {
         Write-Host "[*] $ServiceId already running"
         return
@@ -408,6 +483,7 @@ function Restart-InternetService {
 }
 
 function Show-Status {
+    Write-Host "[*] script:  $ScriptDir"
     Write-Host "[*] repo:    $RepoRoot"
     Write-Host "[*] dist:    $DistDir"
     $svc = Get-ServiceObj
@@ -416,10 +492,17 @@ function Show-Status {
         Write-Host "    install: .\internet-service.ps1 install"
         return
     }
+    $regRaw = Get-RegisteredImagePath
+    $regNorm = Normalize-ExePath $regRaw
+    $wantNorm = Normalize-ExePath $WrapperExe
     Write-Host "[*] $ServiceId"
     Write-Host "    status:     $($svc.Status)"
     Write-Host "    start type: $($svc.StartType)"
     Write-Host "    wrapper:    $WrapperExe"
+    Write-Host "    ImagePath:  $regRaw"
+    if ($regNorm -and -not ($regNorm -ieq $wantNorm)) {
+        Write-Host "    [!] ImagePath mismatch — run: .\internet-service.bat start   (auto-fixes)"
+    }
     Write-Host "    config:     $(Join-Path $DistDir $DistConfigRel)"
     Write-Host "    logs:       $LogDir"
     if (Test-Path $LogDir) {
