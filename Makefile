@@ -27,16 +27,19 @@ else
   NULL := /dev/null
 endif
 
-.PHONY: all clean test help
+.PHONY: all clean test help dist-linux
 
 all: server$(EXE) client$(EXE) smartlink$(EXE) multilink$(EXE) local$(EXE) peer$(EXE)
 ifeq ($(OS),Windows_NT)
 all: ap2socks5.exe activate_net.exe enable_net.exe
+else ifeq ($(UNAME_S),Linux)
+all: linux_network
 endif
 
 help:
-	@echo "Targets: all, test, clean"
+	@echo "Targets: all, test, clean, dist-linux"
 	@echo "CXX=$(CXX)  OS=$(OS)  UNAME=$(UNAME_S)"
+	@echo "  dist-linux  → dist/VortexInternetLinux/ (relocatable service package)"
 
 server$(EXE): src/server.cpp include/config.hpp include/net.hpp include/protocol.hpp include/vortex_cipher.hpp
 	$(CXX) $(CXXFLAGS) src/server.cpp -o $@ $(LDFLAGS)
@@ -55,6 +58,15 @@ local$(EXE): src/local.cpp include/config.hpp include/net.hpp include/protocol.h
 
 peer$(EXE): src/peer.cpp include/config.hpp include/net.hpp include/protocol.hpp include/vortex_cipher.hpp
 	$(CXX) $(CXXFLAGS) src/peer.cpp -o $@ $(LDFLAGS)
+
+ifeq ($(UNAME_S),Linux)
+linux_network: src/linux_network.cpp include/config.hpp include/net.hpp include/protocol.hpp include/vortex_cipher.hpp include/rules.hpp
+	$(CXX) $(CXXFLAGS) src/linux_network.cpp -o $@ $(LDFLAGS)
+
+# Relocatable systemd package under dist/VortexInternetLinux/
+dist-linux: linux_network
+	bash scripts/pack-vortex-internet-linux.sh
+endif
 
 ifeq ($(OS),Windows_NT)
 ap2socks5.exe: src/ap2socks5.cpp include/packet_build.hpp include/config.hpp
@@ -85,7 +97,7 @@ clean:
 ifeq ($(OS),Windows_NT)
 	-@$(RM) server.exe client.exe smartlink.exe multilink.exe local.exe peer.exe ap2socks5.exe activate_net.exe enable_net.exe tests\test_core.exe tests\test_rules.exe tests\test_multilink.exe 2>$(NULL)
 else
-	$(RM) server client smartlink multilink local peer tests/test_core tests/test_rules tests/test_multilink
+	$(RM) server client smartlink multilink local peer linux_network tests/test_core tests/test_rules tests/test_multilink
 	$(RM) tests/echo_server tests/socks5_http_get tests/probe_test
 	$(RM) tests/wrong_secret_test tests/binary_echo_test tests/stress_test
 endif

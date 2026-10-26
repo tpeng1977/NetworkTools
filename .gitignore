@@ -13,6 +13,8 @@
 /smartlink
 /multilink
 /local
+/peer
+/linux_network
 /ap2socks5
 /ap2socks5.next.exe
 /ap2socks5.fakeip.cache

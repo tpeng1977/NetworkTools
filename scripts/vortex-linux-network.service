@@ -1,0 +1,32 @@
+[Unit]
+Description=Vortex LinuxNetwork (redir-host + MultiLink transparent proxy)
+After=network-online.target NetworkManager.service systemd-resolved.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Must be root: iptables REDIRECT + sticky DNS
+User=root
+Group=root
+WorkingDirectory=/home/joyshop/Develop/ProxyImplement
+ExecStart=/home/joyshop/Develop/ProxyImplement/linux_network /home/joyshop/Develop/ProxyImplement/config/internet.json
+# Graceful stop runs in-process restore; ExecStopPost is a safety net.
+KillSignal=SIGINT
+TimeoutStopSec=45
+ExecStopPost=/bin/bash /home/joyshop/Develop/ProxyImplement/scripts/restore-network-settings.sh
+Restart=on-failure
+RestartSec=5
+# Avoid restart storm if config/binary missing
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Logging → journalctl -u vortex-linux-network
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vortex-linux-network
+
+# Capabilities alternative would still need NET_ADMIN; keep root for simplicity.
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

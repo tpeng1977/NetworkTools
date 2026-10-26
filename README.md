@@ -18,16 +18,17 @@ Supports **Linux**, **Windows**, and **macOS**.
 - ActivateNet: system-wide transparent proxy for **this PC’s apps** (WinDivert, fake-IP DNS → local SOCKS5 on multilink/smartlink — no SOCKS setting in apps)
 - EnableNet: same goal as ActivateNet with **redir-host** DNS (real A when unique; `198.18` stand-in on collision) → SOCKS5 CONNECT(domain)
 - **Internet** (`internet.exe`): MultiLink + EnableNet **in one process** — same `multilink.json` / rules; system apps need no proxy settings; in-process loopback SOCKS + self-port / all-uplink-IP exclusion
+- **LinuxNetwork** (`linux_network`): Linux equivalent of `internet.exe` — MultiLink + redir-host via **iptables** (no TUN); systemd package under `dist/VortexInternetLinux/`
 - AP2Socks5 + only-ap: Windows Mobile Hotspot clients → local SOCKS5 (WinDivert, fake-IP DNS)
-- Separate JSON configs for server, client, smartlink, multilink, local, peer, activate_net, enable_net, internet, ap2socks5, hotspot
+- Separate JSON configs for server, client, smartlink, multilink, local, peer, activate_net, enable_net, internet / linux_network, ap2socks5, hotspot
 - Designed for long-running use (timeouts, keepalive, connection limits)
 
 ## Requirements
 
 | Platform | Compiler | Notes |
 |----------|----------|-------|
-| Linux | g++ or clang++ (C++17) | `pthread` |
-| macOS | clang++ (Xcode / Command Line Tools) | `SO_NOSIGPIPE` handled in code |
+| Linux | g++ or clang++ (C++17) | `pthread`; transparent mode needs root + `iptables` |
+| macOS | clang++ (Xcode / Command Line Tools) | `SO_NOSIGPIPE` handled in code; **no** `linux_network` (iptables-only) |
 | Windows | MinGW-w64 / MSYS2 `g++` | links `ws2_32` |
 
 Optional: CMake >= 3.14
@@ -326,6 +327,65 @@ internet-service.bat uninstall -Purge
 
 `install` runs `stage` first, then registers the service with working directory `dist\VortexInternet\`. Same actions via `.\internet-service.ps1 <action>`. After rebuilding `internet.exe`, re-run `stage` or `install` to refresh `dist\`. Offline: place [WinSW-x64.exe](https://github.com/winsw/winsw/releases) at `tools\WinSW-x64.exe` and use `-Offline`.
 
+## LinuxNetwork — MultiLink + redir-host (iptables, one process)
+
+`linux_network` is the **Linux** counterpart of `internet.exe`: in-process MultiLink SOCKS plus sticky **redir-host** DNS, so desktop apps need **no** SOCKS/HTTP proxy settings.
+
+```
+Apps --(no proxy)--> iptables OUTPUT (UDP/53 + learned-IP TCP)
+                          |
+                     loopback SOCKS 127.0.0.1:11080  (in-process MultiLink)
+                          |
+                     DIRECT / link1 / link2 / link3 (peer)
+```
+
+Decision tree matches `internet.cpp`:
+
+- Own egress uses **`SO_MARK`** (never hijacked) + uplink / LAN excludes
+- Sticky DNS: real A when unique; `198.18.0.0/15` stand-in on collision / miss
+- **Learned** TCP → REDIRECT → SOCKS5 **CONNECT(domain)** only
+- **Unlearned** TCP → not redirected (WinDivert reinject equivalent)
+- UDP/443 + UDP/853 rejected so stacks fall back to TCP
+
+```bash
+# Linux only (root for transparent mode)
+make linux_network
+sudo ./linux_network config/internet.json
+
+# SOCKS-only (no iptables): same MultiLink router
+./linux_network --router-only config/internet.json
+```
+
+Config: same `config/internet.json` shape as multilink / Windows Internet (`rules_path`, `geoip_cn`, `geosite_cn`, links, secrets).
+
+If stop leaves DNS/routing broken:
+
+```bash
+sudo ./scripts/restore-network.sh
+```
+
+### Relocatable systemd package
+
+```bash
+make dist-linux    # → dist/VortexInternetLinux/ (gitignored)
+```
+
+Copy that folder anywhere, then:
+
+```bash
+cd /path/to/VortexInternetLinux
+sudo ./install-service.sh      # enable + start vortex-linux-network
+sudo ./uninstall-service.sh    # stop, remove unit, restore network
+```
+
+`install-service.sh` rewrites unit paths from its own directory (safe to relocate). Logs: `journalctl -u vortex-linux-network -f`.
+
+Docker smoke test (privileged, isolated netns):
+
+```bash
+./scripts/test-linux-network.sh --docker
+```
+
 ## Android VPN (VpnService)
 
 Source: `src/android/` — MultiLink + redir-host DNS over Android **VpnService** (desktop `internet.exe` equivalent; no per-app proxy). Config assets mirror `internet.json` / rules.
@@ -423,12 +483,15 @@ src/ap2socks5.cpp      Windows AP → SOCKS5 (WinDivert, fake-IP DNS)
 src/activate_net.cpp   This PC → SOCKS5 (WinDivert, fake-IP DNS)
 src/enable_net.cpp     This PC → SOCKS5 (WinDivert, redir-host DNS)
 src/internet.cpp       MultiLink + EnableNet combined (self-excluding divert)
+src/linux_network.cpp  Linux MultiLink + redir-host (iptables; internet.exe equivalent)
 src/android/           Android VpnService client (Gradle; see src/android/README.md)
 config/                Local JSON/YAML (gitignored) + geo/
 config_example/        Checked-in config templates
-dist/                  Runtime install tree (gitignored; internet service / Android APK)
+dist/                  Runtime install tree (gitignored; Win/Android/Linux packages)
+scripts/               Linux pack/install/restore + e2e test helpers
 internet-service.bat|.ps1  Stage dist\VortexInternet + Windows service control
 build-android.bat      Build Android APK → dist\VortexInternetAndroid\
+make dist-linux        Stage dist/VortexInternetLinux (relocatable systemd package)
 only-ap.bat|.ps1       Mobile Hotspot only
 start-ap2socks5.bat|.ps1  Start/stop ap2socks5 (hotspot must already be up)
 enable-ipv6.bat        Re-enable ms_tcpip6 on adapters (Administrator)

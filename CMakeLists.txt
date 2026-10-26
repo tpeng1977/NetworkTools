@@ -57,6 +57,12 @@ add_executable(peer src/peer.cpp)
 target_include_directories(peer PRIVATE ${VORTEX_INCLUDE_DIR})
 vortex_link_platform(peer)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(linux_network src/linux_network.cpp)
+  target_include_directories(linux_network PRIVATE ${VORTEX_INCLUDE_DIR})
+  vortex_link_platform(linux_network)
+endif()
+
 if(WIN32)
   add_executable(ap2socks5 src/ap2socks5.cpp)
   target_include_directories(ap2socks5 PRIVATE ${VORTEX_INCLUDE_DIR})

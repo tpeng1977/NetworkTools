@@ -64,6 +64,10 @@ echo "[BUILD] peer..."
 $CXX $CXXFLAGS src/peer.cpp -o "peer${EXE}" $LDFLAGS
 
 case "$uname_s" in
+  Linux)
+    echo "[BUILD] linux_network..."
+    $CXX $CXXFLAGS src/linux_network.cpp -o "linux_network${EXE}" $LDFLAGS
+    ;;
   MINGW*|MSYS*|CYGWIN*)
     echo "[BUILD] ap2socks5..."
     $CXX $CXXFLAGS src/ap2socks5.cpp -o "ap2socks5${EXE}" $LDFLAGS -liphlpapi
@@ -99,5 +103,6 @@ echo "  ./smartlink${EXE} config/smartlink.json"
 echo "  ./multilink${EXE} config/multilink.json"
 echo "  ./local${EXE} config/local.json"
 case "$uname_s" in
+  Linux) echo "  sudo ./linux_network${EXE} config/internet.json" ;;
   MINGW*|MSYS*|CYGWIN*) echo "  ./ap2socks5${EXE} config/ap2socks5.json" ;;
 esac

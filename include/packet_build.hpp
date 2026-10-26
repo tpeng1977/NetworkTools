@@ -128,6 +128,27 @@ inline std::vector<uint8_t> build_udp(uint32_t src_net, uint32_t dst_net,
     return pkt;
 }
 
+// ICMP Dest Unreachable (type 3). code 3 = Port Unreachable — makes QUIC/HTTP3
+// stacks fail fast and fall back to TCP instead of hanging on a silent drop.
+inline std::vector<uint8_t> build_icmp_dest_unreach(uint32_t src_net, uint32_t dst_net,
+                                                    uint8_t code,
+                                                    const uint8_t* orig_packet, size_t orig_len,
+                                                    uint16_t ip_id) {
+    if (!orig_packet || orig_len < 20) return {};
+    const int ihl = (orig_packet[0] & 0x0F) * 4;
+    if (ihl < 20 || static_cast<size_t>(ihl) > orig_len) return {};
+    const size_t take = std::min(orig_len, static_cast<size_t>(ihl) + 8);
+    const size_t total = 20 + 8 + take;
+    std::vector<uint8_t> pkt(total, 0);
+    write_ipv4_header(pkt.data(), static_cast<uint16_t>(total), ip_id, 1, src_net, dst_net);
+    uint8_t* icmp = pkt.data() + 20;
+    icmp[0] = 3; // Destination Unreachable
+    icmp[1] = code;
+    std::memcpy(icmp + 8, orig_packet, take);
+    store_be16(icmp + 2, fold_checksum(sum_bytes(icmp, 8 + take)));
+    return pkt;
+}
+
 struct Ipv4L4 {
     bool ok = false;
     bool fragmented = false;
