@@ -311,7 +311,7 @@ From the **repo root**, one command stages a self-contained payload into **`dist
 internet-service.bat stage
 ```
 
-That copies `internet.exe`, WinDivert, `config\internet.json` + rules/geo, and control scripts into `dist\VortexInternet\` (and removes any legacy `VortexInternet.*` / `logs\` left in the repo root by older installs).
+That copies `internet.exe`, WinDivert, MinGW runtime DLLs (`libgcc_s_seh-1.dll`, `libstdc++-6.dll`, `libwinpthread-1.dll` from PATH/`msys64\ucrt64\bin` if needed), `config\internet.json` + rules/geo, and control scripts into `dist\VortexInternet\` (and removes any legacy `VortexInternet.*` / `logs\` left in the repo root by older installs).
 
 Register / control the delayed auto-start service `VortexInternet` (WinSW wrapper; Administrator; auto-elevates):
 

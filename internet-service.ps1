@@ -5,6 +5,7 @@
 # Layout (gitignored):
 #   dist\VortexInternet\
 #     internet.exe, WinDivert*.dll/sys
+#     libgcc_s_seh-1.dll, libstdc++-6.dll, libwinpthread-1.dll  (MinGW runtime)
 #     config\internet.json, multirules.yaml, geo\...
 #     VortexInternet.exe + .xml   (WinSW)
 #     internet-service.ps1/.bat   (local copies for start/stop)
@@ -245,6 +246,70 @@ function Copy-ForceFile([string]$Src, [string]$Dst) {
     Write-Host "[*] copy $(Split-Path -Leaf $Src) → $Dst"
 }
 
+# MinGW/MSYS2 shared runtimes required by dynamically-linked internet.exe.
+$script:MingwRuntimeDlls = @(
+    "libgcc_s_seh-1.dll",
+    "libstdc++-6.dll",
+    "libwinpthread-1.dll"
+)
+
+function Get-MingwBinDirs {
+    # Prefer toolchain / repo copies as sources — never DistDir (avoid copy-to-self).
+    $dirs = New-Object System.Collections.Generic.List[string]
+    $repo = [IO.Path]::GetFullPath($RepoRoot)
+    if ((Test-Path -LiteralPath $repo) -and -not $dirs.Contains($repo)) { $dirs.Add($repo) }
+    foreach ($cmd in @("g++", "c++", "objdump")) {
+        $c = Get-Command $cmd -ErrorAction SilentlyContinue
+        if ($c -and $c.Source) {
+            $bin = [IO.Path]::GetFullPath((Split-Path -Parent $c.Source))
+            if ($bin -and -not $dirs.Contains($bin)) { $dirs.Add($bin) }
+        }
+    }
+    foreach ($d in @(
+            "C:\msys64\ucrt64\bin",
+            "C:\msys64\mingw64\bin",
+            "C:\msys64\clang64\bin",
+            "C:\msys64\mingw32\bin"
+        )) {
+        if ((Test-Path -LiteralPath $d) -and -not $dirs.Contains($d)) { $dirs.Add($d) }
+    }
+    return $dirs
+}
+
+function Resolve-MingwRuntimeDll([string]$Name) {
+    foreach ($dir in (Get-MingwBinDirs)) {
+        $p = Join-Path $dir $Name
+        if (Test-Path -LiteralPath $p) { return (Resolve-Path -LiteralPath $p).Path }
+    }
+    return $null
+}
+
+function Copy-MingwRuntimeDlls {
+    $missing = @()
+    foreach ($name in $script:MingwRuntimeDlls) {
+        $dst = Join-Path $DistDir $name
+        $src = Resolve-MingwRuntimeDll $name
+        if (-not $src) {
+            if (Test-Path -LiteralPath $dst) {
+                Write-Host "[*] keep existing $dst"
+                continue
+            }
+            $missing += $name
+            continue
+        }
+        $srcFull = [IO.Path]::GetFullPath($src)
+        $dstFull = [IO.Path]::GetFullPath($dst)
+        if ($srcFull -ieq $dstFull) {
+            Write-Host "[*] keep existing $dst"
+            continue
+        }
+        Copy-ForceFile $src $dst
+    }
+    if ($missing.Count -gt 0) {
+        throw ("Missing MinGW runtime DLL(s): {0}. Put them next to internet.exe, or ensure MSYS2 ucrt64\bin is on PATH (g++)." -f ($missing -join ", "))
+    }
+}
+
 function Publish-DistPayload {
     Assert-BuildArtifacts
     $srcCfg = Resolve-SourceConfig
@@ -262,6 +327,7 @@ function Publish-DistPayload {
     Copy-ForceFile (Join-Path $RepoRoot "internet.exe") (Join-Path $DistDir "internet.exe")
     Copy-ForceFile (Join-Path $RepoRoot "WinDivert.dll") (Join-Path $DistDir "WinDivert.dll")
     Copy-ForceFile (Join-Path $RepoRoot "WinDivert64.sys") (Join-Path $DistDir "WinDivert64.sys")
+    Copy-MingwRuntimeDlls
 
     # Keep relative paths inside JSON (config\..., config\geo\...) valid under DistDir.
     Copy-ForceFile $srcCfg (Join-Path $DistDir $DistConfigRel)
