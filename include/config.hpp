@@ -267,6 +267,9 @@ struct LinkEndpoint {
 };
 
 // peer.exe — dials into server, registers with peer_secret, exits traffic for VIA_PEER.
+// Optional SSH-style forwards (see include/port_forward.hpp):
+//   to_remote ≈ ssh -R : server binds remote_*, peer dials local_*
+//   to_local  ≈ ssh -L : peer binds local_*, server dials remote_*
 struct PeerConfig {
     std::string server_ip = "127.0.0.1";
     int server_port = 18888;
@@ -276,8 +279,19 @@ struct PeerConfig {
     int padding_max = 64;
     int idle_timeout_sec = 300;
     int max_payload = 32768;
-    int workers = 64; // concurrent jobs (= browser parallel HTTPS); each reuses the TCP session
+    int workers = 64; // concurrent VIA_PEER jobs; each reuses the TCP session
     int reconnect_ms = 200;
+    bool enable_udp = true;
+    int udp_workers = 2;       // dedicated UDP mux sessions peer↔server
+    int udp_idle_sec = 60;     // UDP session affinity idle expiry
+    int forward_max_conns = 512; // bound concurrent TCP forward streams
+    int listen_backlog = 128;
+
+    // Populated by PeerConfig::load via port_forward.hpp (not JsonConfig flat keys).
+    // Stored as opaque blobs here to keep this header free of port_forward include;
+    // peer.cpp loads them with load_peer_forwards().
+    std::string to_remote_json; // raw object slice (may be empty)
+    std::string to_local_json;
 
     static PeerConfig load(const std::string& path) {
         JsonConfig j(path);
@@ -292,6 +306,11 @@ struct PeerConfig {
         c.max_payload = j.get_int("max_payload", c.max_payload);
         c.workers = j.get_int("workers", c.workers);
         c.reconnect_ms = j.get_int("reconnect_ms", c.reconnect_ms);
+        c.enable_udp = j.get_bool("enable_udp", c.enable_udp);
+        c.udp_workers = j.get_int("udp_workers", c.udp_workers);
+        c.udp_idle_sec = j.get_int("udp_idle_sec", c.udp_idle_sec);
+        c.forward_max_conns = j.get_int("forward_max_conns", c.forward_max_conns);
+        c.listen_backlog = j.get_int("listen_backlog", c.listen_backlog);
         if (c.padding_min < 0) c.padding_min = 0;
         if (c.padding_max < c.padding_min) c.padding_max = c.padding_min;
         if (c.max_payload < 1024) c.max_payload = 1024;
@@ -299,8 +318,61 @@ struct PeerConfig {
         if (c.workers < 1) c.workers = 1;
         if (c.workers > 256) c.workers = 256;
         if (c.reconnect_ms < 50) c.reconnect_ms = 50;
+        if (c.udp_workers < 0) c.udp_workers = 0;
+        if (c.udp_workers > 32) c.udp_workers = 32;
+        if (c.udp_idle_sec < 5) c.udp_idle_sec = 5;
+        if (c.forward_max_conns < 1) c.forward_max_conns = 1;
+        if (c.forward_max_conns > 8192) c.forward_max_conns = 8192;
+        if (c.listen_backlog < 1) c.listen_backlog = 128;
         if (c.peer_secret.empty()) {
             throw std::runtime_error("peer_secret must be non-empty");
+        }
+
+        // Keep raw nested objects for peer.cpp / tests to parse with port_forward.hpp.
+        std::ifstream in(path);
+        if (in) {
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            const std::string text = ss.str();
+            const std::string pat_r = "\"to_remote\"";
+            const std::string pat_l = "\"to_local\"";
+            auto slice_obj = [&](const std::string& pat) -> std::string {
+                size_t pos = text.find(pat);
+                if (pos == std::string::npos) return {};
+                pos = text.find(':', pos + pat.size());
+                if (pos == std::string::npos) return {};
+                ++pos;
+                while (pos < text.size() &&
+                       std::isspace(static_cast<unsigned char>(text[pos]))) {
+                    ++pos;
+                }
+                if (pos >= text.size() || text[pos] != '{') return {};
+                int depth = 0;
+                bool in_str = false;
+                for (size_t i = pos; i < text.size(); ++i) {
+                    const char ch = text[i];
+                    if (in_str) {
+                        if (ch == '\\' && i + 1 < text.size()) {
+                            ++i;
+                            continue;
+                        }
+                        if (ch == '"') in_str = false;
+                        continue;
+                    }
+                    if (ch == '"') {
+                        in_str = true;
+                        continue;
+                    }
+                    if (ch == '{') ++depth;
+                    else if (ch == '}') {
+                        --depth;
+                        if (depth == 0) return text.substr(pos, i - pos + 1);
+                    }
+                }
+                return {};
+            };
+            c.to_remote_json = slice_obj(pat_r);
+            c.to_local_json = slice_obj(pat_l);
         }
         return c;
     }

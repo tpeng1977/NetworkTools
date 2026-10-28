@@ -356,4 +356,74 @@ inline void shutdown_both(socket_t fd) {
 #endif
 }
 
+inline socket_t create_udp_socket() {
+    socket_t fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd == INVALID_SOCK) return INVALID_SOCK;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&one), sizeof(one));
+    return fd;
+}
+
+inline socket_t create_udp_listen_socket(const std::string& bind_ip, int port) {
+    socket_t fd = create_udp_socket();
+    if (fd == INVALID_SOCK) return INVALID_SOCK;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (bind_ip.empty() || bind_ip == "0.0.0.0") {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+        if (inet_pton(AF_INET, bind_ip.c_str(), &addr.sin_addr) != 1) {
+            net_close(fd);
+            return INVALID_SOCK;
+        }
+    }
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        net_close(fd);
+        return INVALID_SOCK;
+    }
+    return fd;
+}
+
+inline bool udp_send_to(socket_t fd, const uint8_t* data, size_t len,
+                        const sockaddr_in& to) {
+#ifdef _WIN32
+    const int n = ::sendto(fd, reinterpret_cast<const char*>(data),
+                           static_cast<int>(len), 0,
+                           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+#else
+    const ssize_t n = ::sendto(fd, data, len, 0,
+                               reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+#endif
+    return n >= 0 && static_cast<size_t>(n) == len;
+}
+
+inline bool udp_send_to_host(socket_t fd, const uint8_t* data, size_t len,
+                             const std::string& host, uint16_t port) {
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(port);
+    if (inet_pton(AF_INET, host.c_str(), &to.sin_addr) != 1) return false;
+    return udp_send_to(fd, data, len, to);
+}
+
+inline int udp_recv_from(socket_t fd, uint8_t* data, size_t len, sockaddr_in& from) {
+    socklen_type flen = sizeof(from);
+#ifdef _WIN32
+    return ::recvfrom(fd, reinterpret_cast<char*>(data), static_cast<int>(len), 0,
+                      reinterpret_cast<sockaddr*>(&from), &flen);
+#else
+    return static_cast<int>(
+        ::recvfrom(fd, data, len, 0, reinterpret_cast<sockaddr*>(&from), &flen));
+#endif
+}
+
+inline std::string sockaddr_ip_str(const sockaddr_in& a) {
+    char buf[INET_ADDRSTRLEN] = {};
+    if (!inet_ntop(AF_INET, &a.sin_addr, buf, sizeof(buf))) return {};
+    return std::string(buf);
+}
+
 #endif // VORTEX_NET_HPP

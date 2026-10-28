@@ -30,17 +30,20 @@ detect_cxx() {
 }
 
 CXX="$(detect_cxx)"
-CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -Iinclude"
+# Honor caller CXXFLAGS/LDFLAGS (e.g. portable Docker: -static-libstdc++).
+_extra_cxxflags="${CXXFLAGS:-}"
+_extra_ldflags="${LDFLAGS:-}"
+CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -Iinclude ${_extra_cxxflags}"
 LDFLAGS=""
 
 uname_s="$(uname -s 2>/dev/null || echo Unknown)"
 case "$uname_s" in
   MINGW*|MSYS*|CYGWIN*)
-    LDFLAGS="-lws2_32"
+    LDFLAGS="-lws2_32 ${_extra_ldflags}"
     EXE=".exe"
     ;;
   *)
-    LDFLAGS="-pthread"
+    LDFLAGS="-pthread ${_extra_ldflags}"
     EXE=""
     ;;
 esac
@@ -81,12 +84,14 @@ if [[ "${1:-}" == "test" || "${1:-}" == "all" ]]; then
   $CXX $CXXFLAGS tests/test_rules.cpp -o "tests/test_rules${EXE}" $LDFLAGS
   $CXX $CXXFLAGS tests/test_multilink.cpp -o "tests/test_multilink${EXE}" $LDFLAGS
   $CXX $CXXFLAGS tests/test_peer_protocol.cpp -o "tests/test_peer_protocol${EXE}" $LDFLAGS
+  $CXX $CXXFLAGS tests/test_port_forward.cpp -o "tests/test_port_forward${EXE}" $LDFLAGS
   echo "[TEST] running unit tests..."
   "./tests/test_core${EXE}"
   "./tests/test_packet_build${EXE}"
   "./tests/test_rules${EXE}"
   "./tests/test_multilink${EXE}"
   "./tests/test_peer_protocol${EXE}"
+  "./tests/test_port_forward${EXE}"
 fi
 
 if [[ "${1:-}" == "all" ]]; then

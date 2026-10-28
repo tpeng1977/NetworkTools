@@ -40,6 +40,7 @@ help:
 	@echo "Targets: all, test, clean, dist-linux"
 	@echo "CXX=$(CXX)  OS=$(OS)  UNAME=$(UNAME_S)"
 	@echo "  dist-linux  → dist/VortexInternetLinux/ (relocatable service package)"
+	@echo "Portable Ubuntu 22.04 / glibc≤2.35 binaries: ./build-portable.sh"
 
 server$(EXE): src/server.cpp include/config.hpp include/net.hpp include/protocol.hpp include/vortex_cipher.hpp
 	$(CXX) $(CXXFLAGS) src/server.cpp -o $@ $(LDFLAGS)

@@ -59,6 +59,38 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+### Portable Linux (Ubuntu 22.04 / glibc ≤ 2.35)
+
+Native `./build.sh` on a newer host (e.g. Ubuntu 24.04, glibc 2.39) can produce binaries that fail on older deploy hosts with:
+
+```text
+version `GLIBC_2.38' not found
+version `GLIBCXX_3.4.32' not found
+```
+
+**Do not** rely on fully-static glibc linking. Prefer building with an older toolchain:
+
+```bash
+chmod +x build-portable.sh
+./build-portable.sh
+# → dist/portable-linux/{server,peer,client,...}
+```
+
+This uses Docker (`ubuntu:22.04`) plus `-static-libstdc++ -static-libgcc`, so the binary needs the target’s glibc (≥ 2.35 class) but not a matching newer `libstdc++`.
+
+```bash
+# build machine → deploy machine
+scp dist/portable-linux/server dist/portable-linux/peer user@host:~/
+# on deploy host
+./server config/server.json
+
+# verify max GLIBC version (≤ 2.35)
+./build-portable.sh --verify-only dist/portable-linux/server
+objdump -T dist/portable-linux/server | grep -oE 'GLIBC_[0-9.]+' | sort -Vu
+```
+
+Requires Docker (or `DOCKER=podman ./build-portable.sh`).
+
 ### Windows (MinGW / MSYS2)
 
 ```bat
@@ -153,10 +185,19 @@ multilink.exe config\multilink.json
 | `peer_secret` | Must match the multilink link’s `peer_secret` |
 | `workers` | Parallel registered sessions (each handles many jobs; raise if sites open many concurrent HTTPS) |
 | `reconnect_ms` | Delay after a control-session drop before re-HELLO |
+| `to_remote` | SSH `-R` style: server binds `remote_ip:remote_ports`; traffic tunnels to `local_ip:local_ports` on the peer |
+| `to_local` | SSH `-L` style: peer binds `local_ip:local_ports`; traffic tunnels to `remote_ip:remote_ports` reachable from the server |
+| `enable_udp` | Also forward UDP for `to_remote` / `to_local` (default true) |
+| `udp_idle_sec` | UDP session-affinity idle expiry |
+| `forward_max_conns` | Cap concurrent TCP forward streams |
+
+Port lists may mix integers and inclusive range strings (`"8891-8999"`). After expansion, `remote_ports` and `local_ports` must have equal length (paired by index).
 
 On a multilink link, set `"peer_secret": "..."` to send `VIA_PEER` instead of a normal `CONNECT` (server then forwards to a matching peer).
 
 Idle / NAT notes: peer↔server control links use TCP keepalive (~60s) and peers re-HELLO after ~90s idle. If a pooled socket is half-dead, the server drops it on the next `VIA_PEER` and tries another worker — restarting only `peer` is enough; you should not need to restart `server`.
+
+Linux port-forward e2e: `bash tests/run_port_forward.sh`
 
 ## SOCKS5 front ends (pick one)
 
@@ -544,6 +585,8 @@ Covered scenarios:
    - `CONNECT` (0x01) — normal client tunnel to a target
    - `PEER_HELLO` (0x06) — peer registers with `peer_secret` and waits for jobs
    - `VIA_PEER` (0x07) — client asks server to forward the CONNECT target through a matching peer
+   - `FWD_CONFIG` (0x08) — peer advertises `to_remote` / `to_local` maps after HELLO
+   - `UDP_DATA` (0x09) / `UDP_CLOSE` (0x0A) — UDP datagram relay on a dedicated mux session
 5. Anything else gets active-probe camouflage (HTTP 404-style reply when enabled).
 
 ## License / disclaimer

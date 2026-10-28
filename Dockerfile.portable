@@ -1,0 +1,28 @@
+# Portable Linux build for glibc 2.35-class hosts (Ubuntu 22.04 / Debian 12 peers).
+# Prefer this over fully-static glibc linking. See ./build-portable.sh
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+       g++ \
+       make \
+       ca-certificates \
+       binutils \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY include/ include/
+COPY src/ src/
+COPY build.sh Makefile ./
+
+# Build against Ubuntu 22.04's glibc (~2.35). Statically link libstdc++/libgcc so
+# the binary does not require a newer GLIBCXX from the deploy host's libstdc++.
+# build.sh supplies -std=c++17 / -pthread; only pass the static extras here.
+ENV CXX=g++
+ENV LDFLAGS="-static-libstdc++ -static-libgcc"
+
+RUN chmod +x build.sh && ./build.sh
+
+# Optional: keep verification tools in the image for `docker run` checks.
+CMD ["bash", "-lc", "objdump -T server | grep -oE 'GLIBC_[0-9.]+' | sort -Vu"]

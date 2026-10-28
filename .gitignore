@@ -32,7 +32,7 @@
 /build/
 /cmake-build-*/
 
-# Test binaries / logs (keep *.cpp / *.sh / *.ps1)
+# Test binaries / logs (keep *.cpp / *.sh / *.ps1 / *.json)
 /tests/*.exe
 /tests/*.log
 /tests/*.err
@@ -43,6 +43,13 @@
 /tests/srv.err
 /tests/echo.log
 /tests/echo.err
+/tests/echo_server
+/tests/tcp_echo_client
+/tests/udp_echo
+/tests/udp_echo_client
+/tests/test_port_forward
+/tests/test_peer_protocol
+/tests/peer_sustained_stress
 
 # Local secrets / runtime config (use config_example/ as templates)
 /config/*.json
@@ -72,3 +79,5 @@
 *.user
 .DS_Store
 Thumbs.db
+/tests/port_forward_soak
+/tests/soak_logs/

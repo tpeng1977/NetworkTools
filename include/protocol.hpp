@@ -25,6 +25,10 @@ constexpr uint8_t CMD_CLOSE        = 0x05;
 // Peer relay: peer registers with server; client asks server to forward via peer.
 constexpr uint8_t CMD_PEER_HELLO   = 0x06; // peer→server: data = peer_secret
 constexpr uint8_t CMD_VIA_PEER     = 0x07; // client→server: [u8 len][secret][CONNECT target…]
+// Port forwarding (peer advertises maps; UDP mux uses dedicated peer sessions).
+constexpr uint8_t CMD_FWD_CONFIG   = 0x08; // peer→server after HELLO: PortForward maps
+constexpr uint8_t CMD_UDP_DATA     = 0x09; // UDP datagram on mux: [sid][addr?][payload]
+constexpr uint8_t CMD_UDP_CLOSE    = 0x0A; // UDP session expiry: [sid][flags]
 
 constexpr uint8_t ATYP_IPV4   = 0x01;
 constexpr uint8_t ATYP_DOMAIN = 0x03;

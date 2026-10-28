@@ -111,6 +111,11 @@ target_include_directories(test_peer_protocol PRIVATE ${VORTEX_INCLUDE_DIR})
 vortex_link_platform(test_peer_protocol)
 add_test(NAME test_peer_protocol COMMAND test_peer_protocol WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+add_executable(test_port_forward tests/test_port_forward.cpp)
+target_include_directories(test_port_forward PRIVATE ${VORTEX_INCLUDE_DIR})
+vortex_link_platform(test_port_forward)
+add_test(NAME test_port_forward COMMAND test_port_forward WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_executable(echo_server tests/echo_server.cpp)
 target_include_directories(echo_server PRIVATE ${VORTEX_INCLUDE_DIR})
 vortex_link_platform(echo_server)

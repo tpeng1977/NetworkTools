@@ -44,6 +44,9 @@ int main() {
 
     expect(vortex::build_via_peer_payload("", wire).empty(), "empty secret rejected");
     expect(vortex::CMD_PEER_HELLO == 0x06 && vortex::CMD_VIA_PEER == 0x07, "cmd ids");
+    expect(vortex::CMD_FWD_CONFIG == 0x08 && vortex::CMD_UDP_DATA == 0x09 &&
+               vortex::CMD_UDP_CLOSE == 0x0A,
+           "fwd cmd ids");
 
     if (g_fail) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);

@@ -8,6 +8,24 @@
   "idle_timeout_sec": 300,
   "max_payload": 32768,
   "workers": 64,
-  "reconnect_ms": 200
+  "reconnect_ms": 200,
+  "enable_udp": true,
+  "udp_workers": 1,
+  "udp_idle_sec": 60,
+  "forward_max_conns": 512,
+
+  "to_remote": {
+    "comment": "ssh -R: server binds remote_*; peer dials local_* (do not reuse server bind_port)",
+    "remote_ip": "0.0.0.0",
+    "remote_ports": [17888, 17889, 17890, "17891-17999"],
+    "local_ip": "127.0.0.1",
+    "local_ports": [8888, 8889, 8890, "8891-8999"]
+  },
+  "to_local": {
+    "comment": "ssh -L: peer binds local_*; server dials remote_*",
+    "remote_ip": "127.0.0.1",
+    "remote_ports": [28888, 28889, 28890, "28891-28999"],
+    "local_ip": "0.0.0.0",
+    "local_ports": [38888, 38889, 38890, "38891-38999"]
+  }
 }
-  
