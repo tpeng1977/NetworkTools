@@ -51,6 +51,7 @@
 /tests/test_peer_protocol
 /tests/peer_sustained_stress
 /tests/port_forward_soak
+/tests/udp_strict_harness
 /tests/repeat_logs/
 /tests/soak_logs/
 

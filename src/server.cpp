@@ -716,105 +716,113 @@ void run_udp_mux_server_loop_v2(std::shared_ptr<PeerConn> peer) {
         if (!peer->alive) break;
         if (sel == 0 || !(pfds[0].revents & (POLLIN | POLLERR | POLLHUP))) continue;
 
-        auto frame = vortex::recv_frame(peer->fd, peer->up, peer->cfg.max_payload);
-        if (!frame.ok) {
-            peer->alive = false;
-            break;
-        }
-        if (frame.cmd == vortex::CMD_UDP_DATA) {
-            uint32_t sid = 0;
-            bool has_addr = false;
-            std::string addr_host;
-            uint16_t addr_port = 0;
-            std::vector<uint8_t> payload;
-            uint8_t uflags = 0;
-            if (!vortex::parse_udp_data_payload(frame.data, sid, has_addr, addr_host, addr_port,
-                                                payload, &uflags) ||
-                payload.empty()) {
-                continue;
+        for (int drained = 0; peer->alive && drained < 128; ++drained) {
+            auto frame = vortex::recv_frame(peer->fd, peer->up, peer->cfg.max_payload);
+            if (!frame.ok) {
+                peer->alive = false;
+                break;
             }
-
-            // to_local uplink from peer (flag set) — never consult to_remote sid table.
-            if ((uflags & vortex::UDP_FLAG_TO_LOCAL) != 0) {
-                if (has_addr) {
-                    sockaddr_in tgt{};
-                    tgt.sin_family = AF_INET;
-                    tgt.sin_port = htons(addr_port);
-                    if (inet_pton(AF_INET, addr_host.c_str(), &tgt.sin_addr) != 1) continue;
-                    close_local_sid(sid);
-                    evict_local_if_needed();
-                    socket_t sfd = create_udp_socket();
-                    if (sfd == INVALID_SOCK) continue;
-                    if (!udp_send_to(sfd, payload.data(), payload.size(), tgt)) {
-                        net_close(sfd);
-                        continue;
-                    }
-                    local_sid_socks[sid] = sfd;
-                    local_sid_target[sid] = tgt;
-                    local_sid_last[sid] = std::chrono::steady_clock::now();
-                } else {
-                    auto it = local_sid_socks.find(sid);
-                    auto tit = local_sid_target.find(sid);
-                    if (it == local_sid_socks.end() || tit == local_sid_target.end()) continue;
-                    local_sid_last[sid] = std::chrono::steady_clock::now();
-                    udp_send_to(it->second, payload.data(), payload.size(), tit->second);
-                }
-                continue;
-            }
-
-            // to_remote reply from peer
-            sockaddr_in client{};
-            uint16_t listen_port = 0;
-            bool is_remote = false;
-            {
-                std::lock_guard<std::mutex> lock(g_udp_remote->mu);
-                auto it = g_udp_remote->by_sid.find(sid);
-                if (it != g_udp_remote->by_sid.end()) {
-                    client = it->second.client;
-                    listen_port = it->second.listen_port;
-                    is_remote = true;
-                    it->second.last = std::chrono::steady_clock::now();
-                }
-            }
-            if (is_remote) {
-                socket_t ufd = INVALID_SOCK;
-                {
-                    std::lock_guard<std::mutex> lock(g_fwd_mu);
-                    auto inst = g_fwd_by_secret.find(peer->secret);
-                    if (inst != g_fwd_by_secret.end()) {
-                        for (size_t i = 0; i < inst->second->to_remote.maps.size() &&
-                                           i < inst->second->udp_fds.size();
-                             ++i) {
-                            if (inst->second->to_remote.maps[i].listen_port == listen_port) {
-                                ufd = inst->second->udp_fds[i];
-                                break;
+            if (frame.cmd == vortex::CMD_UDP_DATA) {
+                uint32_t sid = 0;
+                bool has_addr = false;
+                std::string addr_host;
+                uint16_t addr_port = 0;
+                std::vector<uint8_t> payload;
+                uint8_t uflags = 0;
+                if (!vortex::parse_udp_data_payload(frame.data, sid, has_addr, addr_host,
+                                                    addr_port, payload, &uflags) ||
+                    payload.empty()) {
+                    // skip
+                } else if ((uflags & vortex::UDP_FLAG_TO_LOCAL) != 0) {
+                    if (has_addr) {
+                        sockaddr_in tgt{};
+                        tgt.sin_family = AF_INET;
+                        tgt.sin_port = htons(addr_port);
+                        if (inet_pton(AF_INET, addr_host.c_str(), &tgt.sin_addr) == 1) {
+                            close_local_sid(sid);
+                            evict_local_if_needed();
+                            socket_t sfd = create_udp_socket();
+                            if (sfd != INVALID_SOCK) {
+                                if (!udp_send_to(sfd, payload.data(), payload.size(), tgt)) {
+                                    net_close(sfd);
+                                } else {
+                                    local_sid_socks[sid] = sfd;
+                                    local_sid_target[sid] = tgt;
+                                    local_sid_last[sid] = std::chrono::steady_clock::now();
+                                }
                             }
+                        }
+                    } else {
+                        auto it = local_sid_socks.find(sid);
+                        auto tit = local_sid_target.find(sid);
+                        if (it != local_sid_socks.end() && tit != local_sid_target.end()) {
+                            local_sid_last[sid] = std::chrono::steady_clock::now();
+                            udp_send_to(it->second, payload.data(), payload.size(),
+                                        tit->second);
+                        }
+                    }
+                } else {
+                    // to_remote reply from peer
+                    sockaddr_in client{};
+                    uint16_t listen_port = 0;
+                    bool is_remote = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_udp_remote->mu);
+                        auto it = g_udp_remote->by_sid.find(sid);
+                        if (it != g_udp_remote->by_sid.end()) {
+                            client = it->second.client;
+                            listen_port = it->second.listen_port;
+                            is_remote = true;
+                            it->second.last = std::chrono::steady_clock::now();
+                        }
+                    }
+                    if (is_remote) {
+                        socket_t ufd = INVALID_SOCK;
+                        {
+                            std::lock_guard<std::mutex> lock(g_fwd_mu);
+                            auto inst = g_fwd_by_secret.find(peer->secret);
+                            if (inst != g_fwd_by_secret.end()) {
+                                for (size_t i = 0; i < inst->second->to_remote.maps.size() &&
+                                                   i < inst->second->udp_fds.size();
+                                     ++i) {
+                                    if (inst->second->to_remote.maps[i].listen_port ==
+                                        listen_port) {
+                                        ufd = inst->second->udp_fds[i];
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (ufd != INVALID_SOCK) {
+                            udp_send_to(ufd, payload.data(), payload.size(), client);
                         }
                     }
                 }
-                if (ufd != INVALID_SOCK) {
-                    udp_send_to(ufd, payload.data(), payload.size(), client);
+            } else if (frame.cmd == vortex::CMD_UDP_CLOSE) {
+                uint32_t sid = 0;
+                uint8_t cflags = 0;
+                if (vortex::parse_udp_close_payload(frame.data, sid, &cflags)) {
+                    if ((cflags & vortex::UDP_FLAG_TO_LOCAL) != 0) {
+                        close_local_sid(sid);
+                    } else {
+                        std::lock_guard<std::mutex> lock(g_udp_remote->mu);
+                        g_udp_remote->by_sid.erase(sid);
+                        for (auto it = g_udp_remote->by_client.begin();
+                             it != g_udp_remote->by_client.end();) {
+                            if (it->second == sid) it = g_udp_remote->by_client.erase(it);
+                            else ++it;
+                        }
+                    }
                 }
-                continue;
-            }
-        } else if (frame.cmd == vortex::CMD_UDP_CLOSE) {
-            uint32_t sid = 0;
-            uint8_t cflags = 0;
-            if (!vortex::parse_udp_close_payload(frame.data, sid, &cflags)) continue;
-            if ((cflags & vortex::UDP_FLAG_TO_LOCAL) != 0) {
-                close_local_sid(sid);
             } else {
-                std::lock_guard<std::mutex> lock(g_udp_remote->mu);
-                g_udp_remote->by_sid.erase(sid);
-                for (auto it = g_udp_remote->by_client.begin();
-                     it != g_udp_remote->by_client.end();) {
-                    if (it->second == sid) it = g_udp_remote->by_client.erase(it);
-                    else ++it;
-                }
+                peer->alive = false;
+                break;
             }
-        } else {
-            peer->alive = false;
-            break;
+            pollfd_t more{};
+            more.fd = peer->fd;
+            more.events = POLLIN;
+            if (vortex_poll(&more, 1, 0) <= 0) break;
+            if (!(more.revents & (POLLIN | POLLERR | POLLHUP))) break;
         }
     }
     for (auto& kv : local_sid_socks) {

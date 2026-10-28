@@ -1,0 +1,12 @@
+{
+  "bind_ip": "127.0.0.1",
+  "bind_port": 19226,
+  "master_secret": "VortexPortForwardUdpStrictSecret",
+  "padding_min": 4,
+  "padding_max": 16,
+  "camouflage": true,
+  "listen_backlog": 128,
+  "idle_timeout_sec": 60,
+  "max_payload": 32768,
+  "max_connections": 512
+}
