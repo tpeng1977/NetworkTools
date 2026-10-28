@@ -138,6 +138,12 @@ bool handle_one_job(std::shared_ptr<PeerSession> s, const std::vector<uint8_t>& 
     std::cout << "[+] Peer exit " << host << ":" << port << std::endl;
     std::cout.flush();
 
+    // Bound job I/O so a killed server cannot stall this worker for idle_timeout.
+    constexpr int kJobIoSec = 20;
+    constexpr int kTeardownSec = 2;
+    set_recv_timeout(s->server_fd, kJobIoSec);
+    if (tfd != INVALID_SOCK) set_recv_timeout(tfd, kJobIoSec);
+
     std::thread up_relay(relay_target_to_server, s, job);
 
     bool control_ok = true;
@@ -174,16 +180,34 @@ bool handle_one_job(std::shared_ptr<PeerSession> s, const std::vector<uint8_t>& 
     }
 
     job->alive = false;
-    if (job->target_fd != INVALID_SOCK) shutdown_both(job->target_fd);
+    set_recv_timeout(s->server_fd, kTeardownSec);
+    if (job->target_fd != INVALID_SOCK) {
+        set_recv_timeout(job->target_fd, kTeardownSec);
+        shutdown_both(job->target_fd);
+    }
     if (up_relay.joinable()) up_relay.join();
     if (job->target_fd != INVALID_SOCK) {
         net_close(job->target_fd);
         job->target_fd = INVALID_SOCK;
     }
 
+    // Guarantee the server sees a job-end CLOSE so it can drain before pool reuse.
+    if (control_ok && !job->close_sent.exchange(true)) {
+        if (!vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_CLOSE, nullptr, 0,
+                                s->cfg.padding_min, s->cfg.padding_max)) {
+            return false;
+        }
+    }
+
     if (control_ok && !got_server_close && g_running) {
-        set_recv_timeout(s->server_fd, 10);
+        set_recv_timeout(s->server_fd, kTeardownSec);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(kTeardownSec + 1);
         for (;;) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                set_recv_timeout(s->server_fd, s->cfg.idle_timeout_sec);
+                return false;
+            }
             auto fin = vortex::recv_frame(s->server_fd, s->from_server, s->cfg.max_payload);
             if (!fin.ok) {
                 set_recv_timeout(s->server_fd, s->cfg.idle_timeout_sec);
@@ -196,8 +220,8 @@ bool handle_one_job(std::shared_ptr<PeerSession> s, const std::vector<uint8_t>& 
             set_recv_timeout(s->server_fd, s->cfg.idle_timeout_sec);
             return false;
         }
-        set_recv_timeout(s->server_fd, s->cfg.idle_timeout_sec);
     }
+    set_recv_timeout(s->server_fd, s->cfg.idle_timeout_sec);
     return control_ok;
 }
 
@@ -251,8 +275,10 @@ bool run_peer_session(const PeerConfig& cfg, const LoadedForwards& fwd) {
     std::cout << "[*] Peer registered secret_len=" << cfg.peer_secret.size() << std::endl;
     std::cout.flush();
 
+    // Short wait for next job so a dead/replaced server is detected quickly and
+    // worker_loop reconnects (do not block up to full idle_timeout).
     const int job_wait_sec =
-        cfg.idle_timeout_sec > 0 ? (std::min)(90, cfg.idle_timeout_sec) : 90;
+        cfg.idle_timeout_sec > 0 ? (std::min)(30, cfg.idle_timeout_sec) : 30;
 
     while (g_running) {
         set_recv_timeout(fd, job_wait_sec);
@@ -363,9 +389,24 @@ void handle_to_local_tcp_client(socket_t local_fd, PeerConfig cfg, std::string t
     std::cout << "[+] to_local TCP → " << target_host << ":" << target_port << std::endl;
     std::cout.flush();
 
-    std::thread(relay_remote_to_local, s).detach();
+    constexpr int kJobIoSec = 20;
+    constexpr int kTeardownSec = 2;
+    set_recv_timeout(remote_fd, kJobIoSec);
+    set_recv_timeout(local_fd, kJobIoSec);
+
+    std::thread down(relay_remote_to_local, s);
     std::vector<uint8_t> buf(static_cast<size_t>(s->cfg.max_payload));
     while (s->alive && g_running) {
+        pollfd_t pfd{};
+        pfd.fd = local_fd;
+        pfd.events = POLLIN;
+        const int sel = vortex_poll(&pfd, 1, 50);
+        if (!s->alive) break;
+        if (sel < 0) {
+            if (net_would_block(net_errno())) continue;
+            break;
+        }
+        if (sel == 0) continue;
         const int n = recv_some(local_fd, buf.data(), buf.size());
         if (n <= 0) break;
         if (!vortex::send_frame(remote_fd, s->up, vortex::CMD_DATA, buf.data(),
@@ -375,10 +416,13 @@ void handle_to_local_tcp_client(socket_t local_fd, PeerConfig cfg, std::string t
         }
     }
     s->alive = false;
+    set_recv_timeout(remote_fd, kTeardownSec);
+    set_recv_timeout(local_fd, kTeardownSec);
     vortex::send_frame(remote_fd, s->up, vortex::CMD_CLOSE, nullptr, 0, s->cfg.padding_min,
                        s->cfg.padding_max);
     shutdown_both(local_fd);
     shutdown_both(remote_fd);
+    if (down.joinable()) down.join();
 }
 
 void to_local_tcp_accept_loop(socket_t listen_fd, PeerConfig cfg, std::string target_host,

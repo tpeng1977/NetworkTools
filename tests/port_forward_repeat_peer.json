@@ -1,0 +1,28 @@
+{
+  "server_ip": "127.0.0.1",
+  "server_port": 19026,
+  "master_secret": "VortexPortForwardRepeatSecret",
+  "peer_secret": "port_forward_repeat_secret",
+  "padding_min": 4,
+  "padding_max": 24,
+  "idle_timeout_sec": 60,
+  "max_payload": 32768,
+  "workers": 4,
+  "reconnect_ms": 100,
+  "listen_backlog": 128,
+  "enable_udp": true,
+  "udp_idle_sec": 20,
+  "forward_max_conns": 128,
+  "to_remote": {
+    "remote_ip": "127.0.0.1",
+    "remote_ports": [19022],
+    "local_ip": "127.0.0.1",
+    "local_ports": [19002]
+  },
+  "to_local": {
+    "remote_ip": "127.0.0.1",
+    "remote_ports": [19012],
+    "local_ip": "127.0.0.1",
+    "local_ports": [19102]
+  }
+}

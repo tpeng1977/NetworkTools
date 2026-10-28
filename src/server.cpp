@@ -156,6 +156,57 @@ void release_peer(const std::shared_ptr<PeerConn>& p, bool drop) {
     }
 }
 
+// Bound waits so a killed peer/server cannot stall accept/worker threads for idle_timeout.
+constexpr int kPeerJobIoSec = 20;      // during an active TCP forward job
+constexpr int kPeerTeardownSec = 2;    // join / drain after CLOSE
+constexpr int kPeerDrainMaxFrames = 64;
+
+// Finish a peer job before returning the connection to the pool.
+// Without this, a trailing CMD_CLOSE/DATA from the previous job is read as the
+// CONNECT_OK of the next job → second SSH (-R) fails with reset / MAC errors.
+bool drain_peer_job_boundary(const std::shared_ptr<PeerConn>& peer, const ServerConfig& cfg,
+                             bool already_got_close) {
+    if (!peer || !peer->alive || peer->fd == INVALID_SOCK) return false;
+    if (already_got_close) return true;
+    set_recv_timeout(peer->fd, kPeerTeardownSec);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(kPeerTeardownSec + 1);
+    int frames = 0;
+    while (std::chrono::steady_clock::now() < deadline && frames < kPeerDrainMaxFrames) {
+        ++frames;
+        auto frame = vortex::recv_frame(peer->fd, peer->up, cfg.max_payload);
+        if (!frame.ok) {
+            peer->alive = false;
+            return false;
+        }
+        if (frame.cmd == vortex::CMD_CLOSE || frame.cmd == vortex::CMD_CONNECT_FAIL) {
+            set_recv_timeout(peer->fd, cfg.idle_timeout_sec > 0 ? cfg.idle_timeout_sec : 300);
+            return true;
+        }
+        if (frame.cmd == vortex::CMD_DATA) continue; // discard trailing payload
+        peer->alive = false;
+        return false;
+    }
+    peer->alive = false;
+    return false;
+}
+
+void finish_peer_job(std::shared_ptr<PeerConn>& peer, const ServerConfig& cfg, bool peer_link_ok,
+                     bool got_peer_close) {
+    if (!peer) return;
+    // Cap any in-flight recv so join/drain cannot wait for a dead peer's idle_timeout.
+    if (peer->fd != INVALID_SOCK) set_recv_timeout(peer->fd, kPeerTeardownSec);
+    bool reusable = peer_link_ok && peer->alive;
+    if (reusable) {
+        reusable = drain_peer_job_boundary(peer, cfg, got_peer_close);
+    }
+    if (!reusable || !peer->alive) release_peer(peer, true);
+    else {
+        set_recv_timeout(peer->fd, cfg.idle_timeout_sec > 0 ? cfg.idle_timeout_sec : 300);
+        release_peer(peer, false);
+    }
+}
+
 // ---- to_remote forward registry (installed from peer FWD_CONFIG) ----
 
 struct FwdBinding {
@@ -234,7 +285,8 @@ void relay_target_to_client(std::shared_ptr<ServerSession> s) {
     shutdown_both(s->client_fd);
 }
 
-void relay_peer_to_client(std::shared_ptr<ServerSession> s, std::shared_ptr<PeerConn> peer) {
+void relay_peer_to_client(std::shared_ptr<ServerSession> s, std::shared_ptr<PeerConn> peer,
+                          std::atomic<bool>* got_peer_close = nullptr) {
     while (s->alive && peer->alive && g_running) {
         auto frame = vortex::recv_frame(peer->fd, peer->up, s->cfg.max_payload);
         if (!frame.ok) {
@@ -249,6 +301,7 @@ void relay_peer_to_client(std::shared_ptr<ServerSession> s, std::shared_ptr<Peer
                 }
             }
         } else if (frame.cmd == vortex::CMD_CLOSE || frame.cmd == vortex::CMD_CONNECT_FAIL) {
+            if (got_peer_close) got_peer_close->store(true);
             break;
         } else {
             peer->alive = false;
@@ -261,7 +314,7 @@ void relay_peer_to_client(std::shared_ptr<ServerSession> s, std::shared_ptr<Peer
 
 // Relay between an accepted local TCP client and a peer CONNECT job (to_remote).
 void relay_peer_to_local(socket_t local_fd, std::shared_ptr<PeerConn> peer, ServerConfig cfg,
-                         std::atomic<bool>& alive) {
+                         std::atomic<bool>& alive, std::atomic<bool>& got_peer_close) {
     while (alive && peer->alive && g_running) {
         auto frame = vortex::recv_frame(peer->fd, peer->up, cfg.max_payload);
         if (!frame.ok) {
@@ -274,6 +327,7 @@ void relay_peer_to_local(socket_t local_fd, std::shared_ptr<PeerConn> peer, Serv
                 break;
             }
         } else if (frame.cmd == vortex::CMD_CLOSE || frame.cmd == vortex::CMD_CONNECT_FAIL) {
+            got_peer_close.store(true);
             break;
         } else {
             peer->alive = false;
@@ -308,13 +362,18 @@ bool open_peer_connect_job(std::shared_ptr<PeerConn>& peer, const std::string& s
             peer.reset();
             continue;
         }
-        set_recv_timeout(peer->fd, cfg.idle_timeout_sec);
-        if (reply.cmd != vortex::CMD_CONNECT_OK) {
+        // Active job uses a bounded I/O timeout so a killed peer unblocks quickly.
+        set_recv_timeout(peer->fd, kPeerJobIoSec);
+        if (reply.cmd == vortex::CMD_CONNECT_OK) return true;
+        // CONNECT_FAIL: peer finished this attempt cleanly and is idle again.
+        // Any other cmd (e.g. leftover CLOSE) means the stream is desynced — drop it.
+        if (reply.cmd == vortex::CMD_CONNECT_FAIL) {
             release_peer(peer, false);
-            peer.reset();
-            return false;
+        } else {
+            release_peer(peer, true);
         }
-        return true;
+        peer.reset();
+        return false;
     }
     return false;
 }
@@ -348,8 +407,9 @@ void handle_to_remote_tcp_client(socket_t client_fd, FwdBinding bind, ServerConf
 
     std::atomic<bool> alive{true};
     std::atomic<bool> relay_done{false};
-    std::thread down([client_fd, peer, cfg, &alive, &relay_done]() {
-        relay_peer_to_local(client_fd, peer, cfg, alive);
+    std::atomic<bool> got_peer_close{false};
+    std::thread down([client_fd, peer, cfg, &alive, &relay_done, &got_peer_close]() {
+        relay_peer_to_local(client_fd, peer, cfg, alive, got_peer_close);
         relay_done.store(true);
     });
 
@@ -379,16 +439,14 @@ void handle_to_remote_tcp_client(socket_t client_fd, FwdBinding bind, ServerConf
     }
 
     alive = false;
+    if (peer && peer->fd != INVALID_SOCK) set_recv_timeout(peer->fd, kPeerTeardownSec);
     if (peer && peer->alive && peer_ok && !close_sent) {
         vortex::send_frame(peer->fd, peer->down, vortex::CMD_CLOSE, nullptr, 0, cfg.padding_min,
                            cfg.padding_max);
         close_sent = true;
     }
     if (down.joinable()) down.join();
-    if (peer) {
-        if (!peer_ok || !peer->alive) release_peer(peer, true);
-        else release_peer(peer, false);
-    }
+    finish_peer_job(peer, cfg, peer_ok, got_peer_close.load());
     shutdown_both(client_fd);
     net_close(client_fd);
 }
@@ -1156,8 +1214,9 @@ void handle_client(socket_t client_fd, ServerConfig cfg) {
 
         auto peer = s->peer;
         std::atomic<bool> relay_done{false};
-        std::thread down_relay([s, peer, &relay_done]() {
-            relay_peer_to_client(s, peer);
+        std::atomic<bool> got_peer_close{false};
+        std::thread down_relay([s, peer, &relay_done, &got_peer_close]() {
+            relay_peer_to_client(s, peer, &got_peer_close);
             relay_done.store(true);
         });
 
@@ -1189,6 +1248,7 @@ void handle_client(socket_t client_fd, ServerConfig cfg) {
         }
 
         s->alive = false;
+        if (peer && peer->fd != INVALID_SOCK) set_recv_timeout(peer->fd, kPeerTeardownSec);
         if (peer && peer->alive && peer_link_ok && !close_to_peer_sent) {
             vortex::send_frame(peer->fd, peer->down, vortex::CMD_CLOSE, nullptr, 0,
                                s->cfg.padding_min, s->cfg.padding_max);
@@ -1196,13 +1256,10 @@ void handle_client(socket_t client_fd, ServerConfig cfg) {
         }
         if (down_relay.joinable()) down_relay.join();
         (void)relay_done;
+        (void)close_to_peer_sent;
 
         if (peer) {
-            if (!peer_link_ok || !peer->alive) {
-                release_peer(peer, true);
-            } else {
-                release_peer(peer, false);
-            }
+            finish_peer_job(peer, s->cfg, peer_link_ok, got_peer_close.load());
             s->peer.reset();
         }
         shutdown_both(client_fd);

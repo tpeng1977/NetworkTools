@@ -50,6 +50,9 @@
 /tests/test_port_forward
 /tests/test_peer_protocol
 /tests/peer_sustained_stress
+/tests/port_forward_soak
+/tests/repeat_logs/
+/tests/soak_logs/
 
 # Local secrets / runtime config (use config_example/ as templates)
 /config/*.json

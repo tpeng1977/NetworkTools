@@ -22,6 +22,7 @@
    inline bool net_would_block(int e) {
        return e == WSAEWOULDBLOCK || e == WSAEINTR;
    }
+   inline bool net_interrupted(int e) { return e == WSAEINTR; }
 #else
 #  include <arpa/inet.h>
 #  include <fcntl.h>
@@ -39,6 +40,7 @@
    inline bool net_would_block(int e) {
        return e == EAGAIN || e == EWOULDBLOCK || e == EINTR;
    }
+   inline bool net_interrupted(int e) { return e == EINTR; }
    // macOS does not provide MSG_NOSIGNAL; use SO_NOSIGPIPE instead.
 #  ifndef MSG_NOSIGNAL
 #    define MSG_NOSIGNAL 0
@@ -133,7 +135,8 @@ inline bool send_all(socket_t fd, const uint8_t* data, size_t len) {
         ssize_t n = ::send(fd, data + sent, len - sent, MSG_NOSIGNAL);
 #endif
         if (n <= 0) {
-            if (n < 0 && net_would_block(net_errno())) continue;
+            // With SO_SNDTIMEO, EAGAIN/EWOULDBLOCK means the send timed out — do not spin.
+            if (n < 0 && net_interrupted(net_errno())) continue;
             return false;
         }
         sent += static_cast<size_t>(n);
@@ -151,7 +154,8 @@ inline bool recv_exact(socket_t fd, uint8_t* data, size_t len) {
         ssize_t n = ::recv(fd, data + got, len - got, 0);
 #endif
         if (n <= 0) {
-            if (n < 0 && net_would_block(net_errno())) continue;
+            // With SO_RCVTIMEO, EAGAIN means the recv timed out — do not spin forever.
+            if (n < 0 && net_interrupted(net_errno())) continue;
             return false;
         }
         got += static_cast<size_t>(n);
