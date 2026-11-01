@@ -17,7 +17,8 @@ void expect(bool ok, const std::string& msg) {
 int main() {
     rules::Engine eng;
     try {
-        eng.load("config/rules.yaml", "config/geo/geoip-cn.txt", "config/geo/geosite-cn.txt");
+        eng.load("config/rules.yaml", "config/geo/geoip-cn.txt", "config/geo/geosite-cn.txt",
+                 "config/geo/geoipv6-cn.txt");
     } catch (const std::exception& e) {
         std::cerr << "[-] " << e.what() << "\n";
         return 1;

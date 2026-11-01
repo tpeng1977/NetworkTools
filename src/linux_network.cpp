@@ -8,10 +8,16 @@
 //   1) In-process MultiLink SOCKS5 on 127.0.0.1
 //   2) iptables OUTPUT: own SO_MARK traffic NEVER hijacked (no self-bite)
 //   3) Sticky redir-host DNS via REDIRECT UDP/53 → local DNS
+//      (A only; AAAA→NODATA — transparent path is IPv4 iptables; PROXY would
+//       leak on native IPv6 if real AAAA were returned)
 //   4) TCP REDIRECT → local transparent port:
 //        learned IP → SOCKS CONNECT(domain) → MultiLink
 //        unlearned  → marked direct (WinDivert reinject equivalent)
 //   5) REJECT UDP/443+853 so stacks fall back to TCP
+//   6) ICMP/ICMPv6 echo-request NFQUEUE → rules; DIRECT=ACCEPT, else Vortex CMD_ICMP + inject
+//
+// DIRECT egress (SOCKS + transparent→SOCKS domain): dual-stack DNS-over-TCP
+// (AAAA then A), IPv6-prefer connect with IPv4 fallback — aligned with multilink.
 //
 // Usage:
 //   sudo ./linux_network config/internet.json
@@ -22,6 +28,7 @@
 #endif
 
 #include "config.hpp"
+#include "icmp_util.hpp"
 #include "net.hpp"
 #include "packet_build.hpp"
 #include "protocol.hpp"
@@ -30,8 +37,14 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
 #include <netinet/tcp.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter/nfnetlink.h>
+#include <linux/netfilter/nfnetlink_queue.h>
 #include <linux/netfilter_ipv4.h>
+#include <linux/netlink.h>
 #include <poll.h>
 #include <csignal>
 #include <sys/file.h>
@@ -45,6 +58,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -69,6 +83,7 @@ inline bool set_mark(socket_t s) {
 inline std::mutex g_mu;
 inline std::unordered_set<uint16_t> g_sports;
 inline std::unordered_set<uint32_t> g_uplink_nets; // network-order IPv4
+inline std::unordered_set<std::string> g_uplink_v6; // 16 raw bytes
 
 inline void register_port(uint16_t sport) {
     if (!sport) return;
@@ -80,18 +95,20 @@ inline void unregister_port(uint16_t sport) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_sports.erase(sport);
 }
-inline void register_socket(socket_t s) {
-    sockaddr_in a{};
-    socklen_type alen = sizeof(a);
-    if (getsockname(s, reinterpret_cast<sockaddr*>(&a), &alen) != 0) return;
-    register_port(ntohs(a.sin_port));
+inline uint16_t socket_local_port(socket_t s) {
+    sockaddr_storage ss{};
+    socklen_type alen = sizeof(ss);
+    if (getsockname(s, reinterpret_cast<sockaddr*>(&ss), &alen) != 0) return 0;
+    if (ss.ss_family == AF_INET) {
+        return ntohs(reinterpret_cast<sockaddr_in*>(&ss)->sin_port);
+    }
+    if (ss.ss_family == AF_INET6) {
+        return ntohs(reinterpret_cast<sockaddr_in6*>(&ss)->sin6_port);
+    }
+    return 0;
 }
-inline void unregister_socket(socket_t s) {
-    sockaddr_in a{};
-    socklen_type alen = sizeof(a);
-    if (getsockname(s, reinterpret_cast<sockaddr*>(&a), &alen) != 0) return;
-    unregister_port(ntohs(a.sin_port));
-}
+inline void register_socket(socket_t s) { register_port(socket_local_port(s)); }
+inline void unregister_socket(socket_t s) { unregister_port(socket_local_port(s)); }
 inline bool is_own_sport(uint16_t sport) {
     std::lock_guard<std::mutex> lock(g_mu);
     return g_sports.count(sport) != 0;
@@ -100,40 +117,72 @@ inline void clear_uplink_ipv4() {
     std::lock_guard<std::mutex> lock(g_mu);
     g_uplink_nets.clear();
 }
+inline void clear_uplink_ipv6() {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_uplink_v6.clear();
+}
 inline void add_uplink_ipv4(uint32_t net_order) {
     if (!net_order) return;
     std::lock_guard<std::mutex> lock(g_mu);
     g_uplink_nets.insert(net_order);
 }
+inline void add_uplink_ipv6(const in6_addr& a) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_uplink_v6.emplace(reinterpret_cast<const char*>(&a), 16);
+}
 inline bool is_uplink_ipv4(uint32_t net_order) {
     std::lock_guard<std::mutex> lock(g_mu);
     return g_uplink_nets.count(net_order) != 0;
+}
+inline bool is_uplink_ipv6(const in6_addr& a) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    return g_uplink_v6.count(std::string(reinterpret_cast<const char*>(&a), 16)) != 0;
 }
 
 // internet.cpp tcp_connect_registered: bind → register → connect. Plus SO_MARK.
 inline socket_t tcp_connect_registered(const std::string& host, int port, int idle_timeout_sec) {
     addrinfo hints{};
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
     addrinfo* res = nullptr;
-    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
+    const std::string host_norm = strip_ip_brackets(host);
+    if (getaddrinfo(host_norm.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
         return INVALID_SOCK;
     }
-    socket_t fd = INVALID_SOCK;
+    std::vector<addrinfo*> ordered;
     for (addrinfo* p = res; p; p = p->ai_next) {
+        if (p->ai_family == AF_INET6) ordered.push_back(p);
+    }
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        if (p->ai_family != AF_INET6) ordered.push_back(p);
+    }
+    socket_t fd = INVALID_SOCK;
+    for (addrinfo* p : ordered) {
         fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd == INVALID_SOCK) continue;
         set_mark(fd);
         set_socket_options(fd, idle_timeout_sec);
-        sockaddr_in local{};
-        local.sin_family = AF_INET;
-        local.sin_addr.s_addr = htonl(INADDR_ANY);
-        local.sin_port = 0;
-        if (::bind(fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
-            net_close(fd);
-            fd = INVALID_SOCK;
-            continue;
+        if (p->ai_family == AF_INET6) {
+            sockaddr_in6 local6{};
+            local6.sin6_family = AF_INET6;
+            local6.sin6_addr = in6addr_any;
+            local6.sin6_port = 0;
+            if (::bind(fd, reinterpret_cast<sockaddr*>(&local6), sizeof(local6)) != 0) {
+                net_close(fd);
+                fd = INVALID_SOCK;
+                continue;
+            }
+        } else {
+            sockaddr_in local{};
+            local.sin_family = AF_INET;
+            local.sin_addr.s_addr = htonl(INADDR_ANY);
+            local.sin_port = 0;
+            if (::bind(fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+                net_close(fd);
+                fd = INVALID_SOCK;
+                continue;
+            }
         }
         register_socket(fd);
         if (::connect(fd, p->ai_addr, static_cast<socklen_type>(p->ai_addrlen)) == 0) break;
@@ -151,6 +200,129 @@ inline socket_t tcp_connect_marked(const std::string& host, int port, int idle_t
 inline socket_t tcp_connect_direct_marked(const std::string& host, int port, int idle_timeout_sec) {
     return tcp_connect_registered(host, port, idle_timeout_sec);
 }
+inline socket_t tcp_connect_marked_hosts(const std::vector<std::string>& hosts, int port,
+                                         int idle_timeout_sec,
+                                         ConnectHostsDetail* detail = nullptr) {
+    if (detail) {
+        detail->used_host.clear();
+        detail->failed_hosts.clear();
+    }
+    for (const auto& h : hosts) {
+        if (h.empty()) continue;
+        socket_t fd = tcp_connect_marked(h, port, idle_timeout_sec);
+        if (fd != INVALID_SOCK) {
+            if (detail) detail->used_host = h;
+            return fd;
+        }
+        if (detail) detail->failed_hosts.push_back(h);
+    }
+    return INVALID_SOCK;
+}
+
+// Marked DNS-over-TCP (SO_MARK) so resolve does not loop into divert REDIRECT.
+inline bool dns_tcp_transact_marked(const std::string& resolver, int resolver_port,
+                                    const uint8_t* query, size_t qlen,
+                                    std::vector<uint8_t>& resp, int timeout_sec = 3) {
+    if (!query || qlen < 12 || qlen > 4096) return false;
+    socket_t fd = tcp_connect_marked(strip_ip_brackets(resolver),
+                                     resolver_port > 0 ? resolver_port : 53, timeout_sec);
+    if (fd == INVALID_SOCK) return false;
+    uint8_t lenb[2] = {static_cast<uint8_t>(qlen >> 8), static_cast<uint8_t>(qlen)};
+    if (!send_all(fd, lenb, 2) || !send_all(fd, query, qlen)) {
+        net_close(fd);
+        return false;
+    }
+    uint8_t rlenb[2];
+    if (!recv_exact(fd, rlenb, 2)) {
+        net_close(fd);
+        return false;
+    }
+    const size_t rlen = (static_cast<size_t>(rlenb[0]) << 8) | rlenb[1];
+    if (rlen < 12 || rlen > 4096) {
+        net_close(fd);
+        return false;
+    }
+    resp.resize(rlen);
+    if (!recv_exact(fd, resp.data(), rlen)) {
+        net_close(fd);
+        return false;
+    }
+    net_close(fd);
+    return true;
+}
+
+// Dual-stack AAAA→A resolve via marked DNS-over-TCP (IPv6 hosts first).
+inline bool resolve_hosts_dns_tcp_marked(const std::string& name,
+                                         std::vector<std::string>& out_hosts,
+                                         const char* resolver = "8.8.8.8",
+                                         int timeout_sec = 3, int resolver_port = 53) {
+    out_hosts.clear();
+    in_addr lit{};
+    if (inet_pton(AF_INET, name.c_str(), &lit) == 1) {
+        out_hosts.push_back(name);
+        return true;
+    }
+    in6_addr lit6{};
+    const std::string bare = strip_ip_brackets(name);
+    if (inet_pton(AF_INET6, bare.c_str(), &lit6) == 1) {
+        out_hosts.push_back(bare);
+        return true;
+    }
+    if (name.empty() || name.size() > 253) return false;
+    if (resolver_port <= 0 || resolver_port > 65535) resolver_port = 53;
+
+    auto try_resolver = [&](const char* r) -> bool {
+        if (!r || !*r) return false;
+        std::vector<std::string> v6, v4;
+        for (uint16_t qtype : {static_cast<uint16_t>(28), static_cast<uint16_t>(1)}) {
+            const auto q = build_dns_query(name, qtype);
+            if (q.empty()) continue;
+            std::vector<uint8_t> resp;
+            if (!dns_tcp_transact_marked(r, resolver_port, q.data(), q.size(), resp, timeout_sec))
+                continue;
+            dns_collect_answer_hosts(resp.data(), resp.size(), v6, v4);
+        }
+        for (const auto& h : v6) {
+            if (std::find(out_hosts.begin(), out_hosts.end(), h) == out_hosts.end())
+                out_hosts.push_back(h);
+        }
+        for (const auto& h : v4) {
+            if (std::find(out_hosts.begin(), out_hosts.end(), h) == out_hosts.end())
+                out_hosts.push_back(h);
+        }
+        return !out_hosts.empty();
+    };
+
+    if (try_resolver(resolver)) return true;
+    if (resolver_port == 53) {
+        if (std::string(resolver) != "8.8.8.8" && try_resolver("8.8.8.8")) return true;
+        if (std::string(resolver) != "1.1.1.1" && try_resolver("1.1.1.1")) return true;
+    }
+    return false;
+}
+
+// DIRECT egress: dual-stack resolve (AAAA then A), IPv6-first connect, marked sockets.
+inline socket_t tcp_connect_direct_marked_host(const std::string& host, int port,
+                                              int idle_timeout_sec,
+                                              const char* resolver = nullptr,
+                                              int resolver_port = 53) {
+    in_addr lit{};
+    if (inet_pton(AF_INET, host.c_str(), &lit) == 1) {
+        return tcp_connect_marked(host, port, idle_timeout_sec);
+    }
+    in6_addr lit6{};
+    if (inet_pton(AF_INET6, strip_ip_brackets(host).c_str(), &lit6) == 1) {
+        return tcp_connect_marked(strip_ip_brackets(host), port, idle_timeout_sec);
+    }
+    std::vector<std::string> hosts;
+    const char* r = (resolver && *resolver) ? resolver : "8.8.8.8";
+    if (resolve_hosts_dns_tcp_marked(host, hosts, r, 3, resolver_port)) {
+        socket_t fd = tcp_connect_marked_hosts(hosts, port, idle_timeout_sec);
+        if (fd != INVALID_SOCK) return fd;
+    }
+    if (resolver_port != 53) return INVALID_SOCK;
+    return tcp_connect_registered(host, port, idle_timeout_sec);
+}
 
 inline socket_t udp_socket_marked() {
     socket_t fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -166,8 +338,10 @@ inline socket_t udp_socket_marked() {
 
 } // namespace linux_self
 
-using ResolveHostFn = std::string (*)(const std::string&);
-ResolveHostFn g_resolve_host_for_direct = nullptr;
+// Optional dual-stack host list for DIRECT (divert may supply uplink DNS).
+// Must return IPv6-before-IPv4 when both exist — never A-only collapse.
+using ResolveHostsFn = bool (*)(const std::string&, std::vector<std::string>&);
+ResolveHostsFn g_resolve_hosts_for_direct = nullptr;
 
 // ---------------------------------------------------------------------------
 // MultiLink SOCKS5 router (same behavior as multilink.cpp / internet router)
@@ -231,6 +405,13 @@ std::string dns_qname(const uint8_t* msg, size_t len) {
         ++hops;
     }
     return rules::to_lower(name);
+}
+
+uint16_t dns_qtype(const uint8_t* msg, size_t len) {
+    if (len < 12) return 0;
+    size_t off = dns_skip_name(msg, len, 12);
+    if (off + 4 > len) return 0;
+    return static_cast<uint16_t>((msg[off] << 8) | msg[off + 1]);
 }
 
 void remember_dns_answers(const uint8_t* msg, size_t len, const std::string& qname) {
@@ -434,14 +615,9 @@ void relay_proxy_down(std::shared_ptr<Session> s) {
     shutdown_both(s->remote_fd);
 }
 
-bool host_is_ipv4_literal(const std::string& host) {
-    in_addr a{};
-    return inet_pton(AF_INET, host.c_str(), &a) == 1;
-}
-
 void prefer_remote_dns_wire(SocksTarget& t, const std::string& domain) {
     if (domain.empty() || domain.size() > 255) return;
-    if (host_is_ipv4_literal(domain)) return;
+    if (host_is_ipv4_literal(domain) || host_is_ipv6_literal(domain)) return;
     t.atyp = vortex::ATYP_DOMAIN;
     t.host = domain;
     t.has_ipv4 = false;
@@ -454,14 +630,40 @@ void prefer_remote_dns_wire(SocksTarget& t, const std::string& domain) {
     t.wire.push_back(static_cast<uint8_t>(t.port & 0xFF));
 }
 
+void log_uplink_connect(const LinkEndpoint& link, const ConnectHostsDetail& detail, bool ok) {
+    if (!ok) {
+        log_line("[-] uplink TCP failed " + link.name + " " +
+                 format_hosts_port(link.uplink_hosts(), link.server_port));
+        return;
+    }
+    if (!detail.failed_hosts.empty()) {
+        std::string failed;
+        for (size_t i = 0; i < detail.failed_hosts.size(); ++i) {
+            if (i) failed += ",";
+            failed += detail.failed_hosts[i];
+            failed += "(";
+            failed += host_family_tag(detail.failed_hosts[i]);
+            failed += ")";
+        }
+        log_line("[*] uplink fallback " + link.name + " failed=[" + failed + "] ok=" +
+                 format_host_port(detail.used_host, link.server_port) + "(" +
+                 host_family_tag(detail.used_host) + ")");
+    } else if (link.uplink_hosts().size() > 1) {
+        log_line("[+] uplink " + link.name + " " +
+                 format_host_port(detail.used_host, link.server_port) + "(" +
+                 host_family_tag(detail.used_host) + ")");
+    }
+}
+
 bool open_proxy(std::shared_ptr<Session> s, const SocksTarget& t) {
-    socket_t remote_fd =
-        linux_self::tcp_connect_marked(s->link.server_ip, s->link.server_port, s->idle_timeout_sec);
+    ConnectHostsDetail detail;
+    socket_t remote_fd = linux_self::tcp_connect_marked_hosts(
+        s->link.uplink_hosts(), s->link.server_port, s->idle_timeout_sec, &detail);
     if (remote_fd == INVALID_SOCK) {
-        log_line("[-] uplink TCP failed " + s->link.name + " " + s->link.server_ip + ":" +
-                 std::to_string(s->link.server_port));
+        log_uplink_connect(s->link, detail, false);
         return false;
     }
+    log_uplink_connect(s->link, detail, true);
     s->remote_fd = remote_fd;
     s->via_proxy = true;
 
@@ -502,12 +704,17 @@ bool open_proxy(std::shared_ptr<Session> s, const SocksTarget& t) {
 
 bool dns_query_direct(const uint8_t* query, size_t qlen, std::vector<uint8_t>& answer) {
     const std::string dns = system_dns_server();
+    const std::string bare = strip_ip_brackets(dns);
+    // Marked UDP path is IPv4-only (SO_MARK divert); IPv6 resolvers use unmarked TCP.
+    if (host_is_ipv6_literal(bare)) {
+        return dns_tcp_transact_raw(bare, 53, query, qlen, answer, 3);
+    }
     socket_t fd = linux_self::udp_socket_marked();
     if (fd == INVALID_SOCK) return false;
     sockaddr_in dst{};
     dst.sin_family = AF_INET;
     dst.sin_port = htons(53);
-    if (inet_pton(AF_INET, dns.c_str(), &dst.sin_addr) != 1) {
+    if (inet_pton(AF_INET, bare.c_str(), &dst.sin_addr) != 1) {
         net_close(fd);
         return false;
     }
@@ -524,6 +731,36 @@ bool dns_query_direct(const uint8_t* query, size_t qlen, std::vector<uint8_t>& a
     net_close(fd);
     if (n <= 0) return false;
     answer.resize(static_cast<size_t>(n));
+    return true;
+}
+
+bool dns_query_tcp_resolver(const std::string& host, uint16_t port, const uint8_t* query,
+                            size_t qlen, std::vector<uint8_t>& answer) {
+    // Marked TCP so DNS-over-TCP to literal resolvers does not loop into TUN.
+    socket_t fd = linux_self::tcp_connect_marked(strip_ip_brackets(host),
+                                                 static_cast<int>(port ? port : 53), 3);
+    if (fd == INVALID_SOCK) return false;
+    uint8_t lenb[2] = {static_cast<uint8_t>(qlen >> 8), static_cast<uint8_t>(qlen)};
+    if (!send_all(fd, lenb, 2) || !send_all(fd, query, qlen)) {
+        net_close(fd);
+        return false;
+    }
+    uint8_t rlenb[2];
+    if (!recv_exact(fd, rlenb, 2)) {
+        net_close(fd);
+        return false;
+    }
+    const size_t rlen = (static_cast<size_t>(rlenb[0]) << 8) | rlenb[1];
+    if (rlen < 12 || rlen > 4096) {
+        net_close(fd);
+        return false;
+    }
+    answer.resize(rlen);
+    if (!recv_exact(fd, answer.data(), rlen)) {
+        net_close(fd);
+        return false;
+    }
+    net_close(fd);
     return true;
 }
 
@@ -567,6 +804,12 @@ bool select_link(const MultilinkConfig& cfg, const rules::Decision& decision,
     return true;
 }
 
+const char* dns_qtype_name(uint16_t qtype) {
+    if (qtype == 1) return "A";
+    if (qtype == 28) return "AAAA";
+    return "OTHER";
+}
+
 void handle_dns(std::shared_ptr<Session> s, const SocksTarget& target,
                 const MultilinkConfig& cfg) {
     if (!reply_socks_ok(s->local_fd)) return;
@@ -578,6 +821,7 @@ void handle_dns(std::shared_ptr<Session> s, const SocksTarget& target,
     if (!recv_exact(s->local_fd, query.data(), qlen)) return;
 
     const std::string name = dns_qname(query.data(), query.size());
+    const uint16_t qtype = dns_qtype(query.data(), query.size());
     const auto decision = g_rules.decide(name.empty() ? target.host : name, false, 0, false);
 
     LinkEndpoint link;
@@ -593,7 +837,8 @@ void handle_dns(std::shared_ptr<Session> s, const SocksTarget& target,
 
     if (cfg.log_decisions) {
         log_line(std::string("[*] DNS ") + rules::decision_name(decision) + " " +
-                 (name.empty() ? target.host : name) + "  (" + decision.matched + ")");
+                 (name.empty() ? target.host : name) + " " + dns_qtype_name(qtype) +
+                 "  (" + decision.matched + ")");
     }
 
     std::vector<uint8_t> framed;
@@ -605,7 +850,12 @@ void handle_dns(std::shared_ptr<Session> s, const SocksTarget& target,
     bool ok = false;
     if (decision.action == rules::Action::Direct) {
         std::vector<uint8_t> answer;
-        ok = dns_query_direct(query.data(), query.size(), answer);
+        // Preserve A/AAAA: prefer literal SOCKS-target resolver via marked TCP.
+        if (host_is_ipv4_literal(target.host) || host_is_ipv6_literal(target.host)) {
+            ok = dns_query_tcp_resolver(target.host, target.port, query.data(), query.size(),
+                                        answer);
+        }
+        if (!ok) ok = dns_query_direct(query.data(), query.size(), answer);
         if (ok) {
             out.push_back(static_cast<uint8_t>(answer.size() >> 8));
             out.push_back(static_cast<uint8_t>(answer.size()));
@@ -621,14 +871,20 @@ void handle_dns(std::shared_ptr<Session> s, const SocksTarget& target,
 }
 
 bool open_direct(std::shared_ptr<Session> s, const SocksTarget& t) {
-    // Sticky/marked resolve — never unmarked DNS-over-TCP (loops into TUN).
-    std::string connect_host = t.host;
-    if (g_resolve_host_for_direct) {
-        const std::string resolved = g_resolve_host_for_direct(t.host);
-        if (!resolved.empty()) connect_host = resolved;
+    // Align with multilink tcp_connect_direct_host: AAAA+A, IPv6-first, then IPv4.
+    // Marked sockets so divert REDIRECT never captures our own DIRECT egress.
+    // Do NOT collapse domains to a single A (old resolve_host_for_direct bug).
+    socket_t remote_fd = INVALID_SOCK;
+    std::vector<std::string> hosts;
+    if (g_resolve_hosts_for_direct && g_resolve_hosts_for_direct(t.host, hosts) &&
+        !hosts.empty()) {
+        prefer_ipv6_order(hosts);
+        remote_fd = linux_self::tcp_connect_marked_hosts(
+            hosts, static_cast<int>(t.port), s->idle_timeout_sec);
+    } else {
+        remote_fd = linux_self::tcp_connect_direct_marked_host(
+            t.host, static_cast<int>(t.port), s->idle_timeout_sec);
     }
-    socket_t remote_fd = linux_self::tcp_connect_direct_marked(
-        connect_host, static_cast<int>(t.port), s->idle_timeout_sec);
     if (remote_fd == INVALID_SOCK) return false;
     s->remote_fd = remote_fd;
     s->via_proxy = false;
@@ -685,7 +941,8 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
                  "  (" + decision.matched + ")" +
                  (link.name.empty()
                       ? ""
-                      : " via " + link.name + " " + link.server_ip +
+                      : " via " + link.name + " " +
+                            format_hosts_port(link.uplink_hosts(), link.server_port) +
                             (link.peer_secret.empty() ? "" : " (peer)")));
     }
 
@@ -698,7 +955,7 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
         }
     } else {
         SocksTarget connect_tgt = target;
-        if (!host_is_ipv4_literal(rule_host)) {
+        if (!host_is_ipv4_literal(rule_host) && !host_is_ipv6_literal(rule_host)) {
             prefer_remote_dns_wire(connect_tgt, rule_host);
         }
         ok = open_proxy(s, connect_tgt);
@@ -743,7 +1000,8 @@ socket_t g_listen = INVALID_SOCK;
 bool start(const MultilinkConfig& cfg) {
     g_cfg = cfg;
     try {
-        router_detail::g_rules.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn);
+        router_detail::g_rules.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn,
+                                    cfg.geoipv6_cn);
     } catch (const std::exception& e) {
         std::cerr << "[-] rules: " << e.what() << "\n";
         return false;
@@ -755,17 +1013,23 @@ bool start(const MultilinkConfig& cfg) {
         return false;
     }
     linux_self::clear_uplink_ipv4();
+    linux_self::clear_uplink_ipv6();
     for (const auto& kv : cfg.links) {
-        in_addr up{};
-        if (inet_pton(AF_INET, kv.second.server_ip.c_str(), &up) == 1) {
-            linux_self::add_uplink_ipv4(up.s_addr);
+        for (const auto& host : kv.second.uplink_hosts()) {
+            in_addr up{};
+            if (inet_pton(AF_INET, host.c_str(), &up) == 1) {
+                linux_self::add_uplink_ipv4(up.s_addr);
+                continue;
+            }
+            in6_addr up6{};
+            if (inet_pton(AF_INET6, strip_ip_brackets(host).c_str(), &up6) == 1) {
+                linux_self::add_uplink_ipv6(up6);
+            }
         }
     }
     std::thread([] {
         while (router_detail::g_running) {
-            sockaddr_in peer{};
-            socklen_type peer_len = sizeof(peer);
-            socket_t local_fd = accept(g_listen, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+            socket_t local_fd = accept_any(g_listen);
             if (local_fd == INVALID_SOCK) {
                 if (!router_detail::g_running) break;
                 continue;
@@ -778,11 +1042,13 @@ bool start(const MultilinkConfig& cfg) {
     std::cout << "[*] rules " << cfg.rules_path
               << " (" << router_detail::g_rules.rule_count() << " entries)"
               << "  GEOIP-CN=" << router_detail::g_rules.cn_cidr_count()
+              << "  GEOIP-CN6=" << router_detail::g_rules.cn_cidr6_count()
               << "  GEOSITE-CN=" << router_detail::g_rules.cn_domain_count()
               << std::endl;
     for (const auto& kv : cfg.links) {
         const auto& L = kv.second;
-        std::cout << "[*] Link " << L.name << " -> " << L.server_ip << ":" << L.server_port
+        std::cout << "[*] Link " << L.name << " -> "
+                  << format_hosts_port(L.uplink_hosts(), L.server_port)
                   << (L.peer_secret.empty() ? "" : "  peer-relay") << std::endl;
     }
     std::cout << "[*] Default link " << cfg.default_link << std::endl;
@@ -849,6 +1115,51 @@ std::string ip_to_string(uint32_t net) {
     a.s_addr = net;
     if (!inet_ntop(AF_INET, &a, buf, sizeof(buf))) return "?";
     return buf;
+}
+std::string ip6_to_string(const in6_addr& a) {
+    char buf[INET6_ADDRSTRLEN] = {};
+    if (!inet_ntop(AF_INET6, &a, buf, sizeof(buf))) return "?";
+    return buf;
+}
+
+// Locate ICMPv6 payload in an IPv6 packet (skips common extension headers).
+bool ipv6_locate_icmp(const uint8_t* pkt, size_t len, in6_addr& src, in6_addr& dst,
+                      const uint8_t*& icmp, size_t& icmplen) {
+    icmp = nullptr;
+    icmplen = 0;
+    if (!pkt || len < 40 || (pkt[0] >> 4) != 6) return false;
+    std::memcpy(&src, pkt + 8, 16);
+    std::memcpy(&dst, pkt + 24, 16);
+    uint8_t nh = pkt[6];
+    size_t off = 40;
+    for (int hops = 0; hops < 8; ++hops) {
+        if (nh == IPPROTO_ICMPV6) {
+            if (off + 8 > len) return false;
+            icmp = pkt + off;
+            icmplen = len - off;
+            return true;
+        }
+        // Hop-by-Hop (0), Dest Options (60), Routing (43)
+        if (nh == 0 || nh == 60 || nh == 43) {
+            if (off + 2 > len) return false;
+            const uint8_t next = pkt[off];
+            const uint8_t hdrlen = pkt[off + 1];
+            const size_t ext = static_cast<size_t>(hdrlen + 1) * 8;
+            if (off + ext > len) return false;
+            nh = next;
+            off += ext;
+            continue;
+        }
+        // Fragment (44)
+        if (nh == 44) {
+            if (off + 8 > len) return false;
+            nh = pkt[off];
+            off += 8;
+            continue;
+        }
+        return false;
+    }
+    return false;
 }
 int run_cmd(const std::string& cmd) {
     const int rc = ::system(cmd.c_str());
@@ -1156,29 +1467,40 @@ bool resolve_ipv4_fast(const std::string& name, uint32_t client_resolver_net, ui
     return false;
 }
 
-std::string resolve_host_for_direct(const std::string& host) {
+// Dual-stack DIRECT resolve for the in-process router (marked DNS-over-TCP).
+// Prefer uplink DNS; always collect AAAA then A (never A-only).
+// Test override: VORTEX_DIRECT_DNS[=host] and optional VORTEX_DIRECT_DNS_PORT.
+bool resolve_hosts_for_direct(const std::string& host, std::vector<std::string>& out) {
+    out.clear();
     in_addr lit{};
-    if (inet_pton(AF_INET, host.c_str(), &lit) == 1) return host;
-    const std::string q = to_lower_host(host);
-    uint32_t ip_net = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_dns_mu);
-        auto it = g_name_to_ip.find(q);
-        if (it != g_name_to_ip.end()) ip_net = it->second;
+    if (inet_pton(AF_INET, host.c_str(), &lit) == 1) {
+        out.push_back(host);
+        return true;
     }
-    if (!ip_net || is_standin_ip(ip_net)) {
-        uint32_t resolver_net = 0;
-        in_addr ra{};
-        if (inet_pton(AF_INET, g_uplink_dns.c_str(), &ra) == 1) resolver_net = ra.s_addr;
-        uint32_t real = 0;
-        if (resolve_ipv4_fast(host, resolver_net, real) && real) ip_net = real;
+    in6_addr lit6{};
+    const std::string bare = strip_ip_brackets(host);
+    if (inet_pton(AF_INET6, bare.c_str(), &lit6) == 1) {
+        out.push_back(bare);
+        return true;
     }
-    if (!ip_net || is_standin_ip(ip_net)) return {};
-    return ip_to_string(ip_net);
+    std::string resolver = g_uplink_dns.empty() ? "8.8.8.8" : g_uplink_dns;
+    int resolver_port = 53;
+    if (const char* env = std::getenv("VORTEX_DIRECT_DNS")) {
+        if (env[0]) resolver = env;
+    }
+    if (const char* envp = std::getenv("VORTEX_DIRECT_DNS_PORT")) {
+        const int p = std::atoi(envp);
+        if (p > 0 && p <= 65535) resolver_port = p;
+    }
+    if (linux_self::resolve_hosts_dns_tcp_marked(host, out, resolver.c_str(), 3, resolver_port)) {
+        prefer_ipv6_order(out);
+        return !out.empty();
+    }
+    return false;
 }
 
 struct DirectResolveInit {
-    DirectResolveInit() { g_resolve_host_for_direct = &resolve_host_for_direct; }
+    DirectResolveInit() { g_resolve_hosts_for_direct = &resolve_hosts_for_direct; }
 };
 DirectResolveInit g_direct_resolve_init;
 
@@ -1371,6 +1693,10 @@ void handle_dns_query(const uint8_t* data, size_t len, const sockaddr_in& peer) 
         }
     };
 
+    // Transparent divert is IPv4 iptables REDIRECT only — no ip6tables TPROXY for
+    // all flows. AAAA→NODATA keeps apps on learned A → SOCKS CONNECT(domain);
+    // the router DIRECT path then does dual-stack IPv6-prefer egress. Returning
+    // real AAAA here would bypass PROXY rules on native IPv6.
     if (qtype != 1) {
         reply(dns_reply_nodata(query), "type" + std::to_string(qtype) + "->NODATA", true);
         return;
@@ -1455,6 +1781,348 @@ void tcp_accept_loop() {
     }
 }
 
+// ---- ICMP / ICMPv6 echo capture (NFQUEUE) + Vortex / DIRECT relay ----
+// iptables/ip6tables cannot REDIRECT ICMP; we NFQUEUE echo-requests, decide via
+// rules, ACCEPT for DIRECT, or DROP + raw inject reply after Vortex CMD_ICMP.
+
+constexpr uint16_t kIcmpQueueNum = 21570;
+std::atomic<uint64_t> g_icmp_ok{0}, g_icmp_fail{0}, g_icmp_direct{0};
+int g_nfq_fd = -1;
+
+bool icmp_via_vortex(const LinkEndpoint& link, const std::string& host,
+                     const std::vector<uint8_t>& req, std::vector<uint8_t>& reply) {
+    reply.clear();
+    socket_t remote_fd = linux_self::tcp_connect_marked_hosts(
+        link.uplink_hosts(), link.server_port, link.idle_timeout_sec > 0 ? link.idle_timeout_sec : 30);
+    if (remote_fd == INVALID_SOCK) return false;
+
+    uint64_t salt = get_random_salt();
+    uint8_t salt_buf[8];
+    std::memcpy(salt_buf, &salt, 8);
+    if (!send_all(remote_fd, salt_buf, 8)) {
+        linux_self::unregister_socket(remote_fd);
+        net_close(remote_fd);
+        return false;
+    }
+    vortex::SessionCrypto up, down;
+    up.init(link.master_secret, salt);
+    down.init(link.master_secret, salt ^ 0xA5A5A5A5A5A5A5A5ULL);
+
+    const auto wire = vortex::build_icmp_wire(host, req.data(), req.size());
+    bool sent = false;
+    if (!link.peer_secret.empty()) {
+        const auto payload = vortex::build_via_peer_icmp_payload(link.peer_secret, wire);
+        sent = !payload.empty() &&
+               vortex::send_frame(remote_fd, up, vortex::CMD_VIA_PEER_ICMP, payload,
+                                  link.padding_min, link.padding_max);
+    } else {
+        sent = !wire.empty() &&
+               vortex::send_frame(remote_fd, up, vortex::CMD_ICMP, wire, link.padding_min,
+                                  link.padding_max);
+    }
+    if (!sent) {
+        linux_self::unregister_socket(remote_fd);
+        net_close(remote_fd);
+        return false;
+    }
+    auto frame = vortex::recv_frame(remote_fd, down, link.max_payload > 0 ? link.max_payload : 32768);
+    linux_self::unregister_socket(remote_fd);
+    net_close(remote_fd);
+    if (!frame.ok || frame.cmd != vortex::CMD_DATA || frame.data.empty()) return false;
+    reply = std::move(frame.data);
+    return true;
+}
+
+// Returns true → NF_ACCEPT (kernel sends). false → NF_DROP (we own the echo).
+// Proxy work is detached so the NFQUEUE verdict is not stalled for RTT.
+bool decide_icmp_packet_v4(const uint8_t* ip_pkt, size_t len) {
+    if (len < 28) return true;
+    const int ihl = (ip_pkt[0] & 0x0F) * 4;
+    if (ihl < 20 || static_cast<size_t>(ihl) + 8 > len) return true;
+    if (ip_pkt[9] != IPPROTO_ICMP) return true;
+    const uint32_t src = *reinterpret_cast<const uint32_t*>(ip_pkt + 12);
+    const uint32_t dst = *reinterpret_cast<const uint32_t*>(ip_pkt + 16);
+    const uint8_t* icmp = ip_pkt + ihl;
+    const size_t icmplen = len - static_cast<size_t>(ihl);
+    if (!vortex::icmp_util::is_echo_request_v4(icmp, icmplen)) return true;
+
+    if (linux_self::is_uplink_ipv4(dst) || is_private_ip(dst)) return true;
+
+    const std::string learned = dns_lookup_name(dst);
+    const std::string rule_host = learned.empty() ? ip_to_string(dst) : learned;
+    const bool has_ip = learned.empty();
+    const uint32_t ip_host = ntohl(dst);
+    const auto decision =
+        router_detail::g_rules.decide(rule_host, has_ip, ip_host, /*allow_dns_resolve=*/false);
+
+    LinkEndpoint link;
+    std::string link_err;
+    if (!router_detail::select_link(linux_router::g_cfg, decision, link, link_err)) {
+        ++g_icmp_fail;
+        return true;
+    }
+
+    if (g_cfg.log_connections || linux_router::g_cfg.log_decisions) {
+        log_line(std::string("[*] ICMP ") + rules::decision_name(decision) + " " + rule_host +
+                 "  (" + decision.matched + ")" +
+                 (link.name.empty() ? "" : " via " + link.name));
+    }
+
+    if (decision.action == rules::Action::Direct) {
+        ++g_icmp_direct;
+        return true;
+    }
+
+    if (is_standin_ip(dst)) {
+        // Stand-in fake-IP is not routable on the remote exit; fail this probe.
+        ++g_icmp_fail;
+        if (g_cfg.log_connections) log_line("[-] ICMP skip stand-in " + rule_host);
+        return false; // DROP without inject → ping timeout (honest failure)
+    }
+
+    std::vector<uint8_t> req(icmp, icmp + icmplen);
+    const std::string exit_host = ip_to_string(dst);
+    const std::string log_host = rule_host;
+    std::thread([link, exit_host, log_host, req, src]() {
+        std::vector<uint8_t> reply;
+        if (!icmp_via_vortex(link, exit_host, req, reply) || reply.empty()) {
+            ++g_icmp_fail;
+            if (g_cfg.log_connections) log_line("[-] ICMP proxy fail " + log_host);
+            return;
+        }
+        if (vortex::icmp_util::inject_echo_reply_v4(src, reply.data(), reply.size(),
+                                                    static_cast<int>(linux_self::kMark))) {
+            ++g_icmp_ok;
+            if (g_cfg.log_connections) {
+                log_line("[+] ICMP reply " + log_host + " via " + link.name);
+            }
+        } else {
+            ++g_icmp_fail;
+        }
+    }).detach();
+    return false; // DROP original; inject reply when Vortex returns
+}
+
+// Returns true → NF_ACCEPT. false → NF_DROP (+ async Vortex inject for PROXY).
+bool decide_icmp_packet_v6(const uint8_t* ip_pkt, size_t len) {
+    in6_addr src{}, dst{};
+    const uint8_t* icmp = nullptr;
+    size_t icmplen = 0;
+    if (!ipv6_locate_icmp(ip_pkt, len, src, dst, icmp, icmplen)) return true;
+    if (!vortex::icmp_util::is_echo_request_v6(icmp, icmplen)) return true;
+
+    const uint8_t* dst_bytes = reinterpret_cast<const uint8_t*>(&dst);
+    if (linux_self::is_uplink_ipv6(dst) || rules::is_private_ipv6(dst_bytes)) return true;
+
+    const std::string rule_host = ip6_to_string(dst);
+    const auto decision =
+        router_detail::g_rules.decide(rule_host, /*has_ip=*/false, 0, /*allow_dns_resolve=*/false);
+
+    LinkEndpoint link;
+    std::string link_err;
+    if (!router_detail::select_link(linux_router::g_cfg, decision, link, link_err)) {
+        ++g_icmp_fail;
+        return true;
+    }
+
+    if (g_cfg.log_connections || linux_router::g_cfg.log_decisions) {
+        log_line(std::string("[*] ICMPv6 ") + rules::decision_name(decision) + " " + rule_host +
+                 "  (" + decision.matched + ")" +
+                 (link.name.empty() ? "" : " via " + link.name));
+    }
+
+    if (decision.action == rules::Action::Direct) {
+        ++g_icmp_direct;
+        return true;
+    }
+
+    std::vector<uint8_t> req(icmp, icmp + icmplen);
+    const std::string exit_host = rule_host;
+    const in6_addr src_copy = src;
+    std::thread([link, exit_host, req, src_copy]() {
+        std::vector<uint8_t> reply;
+        if (!icmp_via_vortex(link, exit_host, req, reply) || reply.empty()) {
+            ++g_icmp_fail;
+            if (g_cfg.log_connections) log_line("[-] ICMPv6 proxy fail " + exit_host);
+            return;
+        }
+        if (vortex::icmp_util::inject_echo_reply_v6(src_copy, reply.data(), reply.size(),
+                                                    static_cast<int>(linux_self::kMark))) {
+            ++g_icmp_ok;
+            if (g_cfg.log_connections) {
+                log_line("[+] ICMPv6 reply " + exit_host + " via " + link.name);
+            }
+        } else {
+            ++g_icmp_fail;
+        }
+    }).detach();
+    return false;
+}
+
+// Minimal NFQUEUE (AF_NETLINK) — no libnetfilter_queue dependency.
+struct NfqSession {
+    int fd = -1;
+    uint16_t queue = 0;
+};
+
+bool nfq_send(int fd, uint16_t nlmsg_type, uint16_t nfgen_subsys, uint8_t nfgen_msg,
+              uint16_t res_id, const void* nla_data, size_t nla_len, uint16_t nla_type) {
+    uint8_t buf[512];
+    std::memset(buf, 0, sizeof(buf));
+    auto* nlh = reinterpret_cast<nlmsghdr*>(buf);
+    auto* nfg = reinterpret_cast<nfgenmsg*>(buf + NLMSG_HDRLEN);
+    nlh->nlmsg_type = static_cast<uint16_t>((nfgen_subsys << 8) | nfgen_msg);
+    nlh->nlmsg_flags = NLM_F_REQUEST;
+    if (nlmsg_type) { /* reserved */ }
+    nfg->nfgen_family = AF_UNSPEC;
+    nfg->version = NFNETLINK_V0;
+    nfg->res_id = htons(res_id);
+
+    size_t off = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(nfgenmsg));
+    if (nla_data && nla_len) {
+        auto* nla = reinterpret_cast<nlattr*>(buf + off);
+        nla->nla_type = nla_type;
+        nla->nla_len = static_cast<uint16_t>(NLA_HDRLEN + nla_len);
+        std::memcpy(buf + off + NLA_HDRLEN, nla_data, nla_len);
+        off += NLA_ALIGN(nla->nla_len);
+    }
+    nlh->nlmsg_len = static_cast<uint32_t>(off);
+    sockaddr_nl sa{};
+    sa.nl_family = AF_NETLINK;
+    return ::sendto(fd, buf, off, 0, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) ==
+           static_cast<ssize_t>(off);
+}
+
+bool nfq_open(NfqSession& s, uint16_t queue) {
+    s.fd = ::socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
+    if (s.fd < 0) return false;
+    int one = 1;
+    setsockopt(s.fd, SOL_NETLINK, NETLINK_NO_ENOBUFS, &one, sizeof(one));
+    sockaddr_nl sa{};
+    sa.nl_family = AF_NETLINK;
+    sa.nl_groups = 0;
+    if (::bind(s.fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+        ::close(s.fd);
+        s.fd = -1;
+        return false;
+    }
+    s.queue = queue;
+
+    // PF bind IPv4 + IPv6, then bind this queue, then COPY_PACKET mode.
+    nfqnl_msg_config_cmd cmd{};
+    cmd.command = NFQNL_CFG_CMD_PF_BIND;
+    cmd.pf = htons(AF_INET);
+    nfq_send(s.fd, 0, NFNL_SUBSYS_QUEUE, NFQNL_MSG_CONFIG, 0, &cmd, sizeof(cmd), NFQA_CFG_CMD);
+    cmd.pf = htons(AF_INET6);
+    nfq_send(s.fd, 0, NFNL_SUBSYS_QUEUE, NFQNL_MSG_CONFIG, 0, &cmd, sizeof(cmd), NFQA_CFG_CMD);
+
+    cmd = {};
+    cmd.command = NFQNL_CFG_CMD_BIND;
+    cmd.pf = htons(AF_INET);
+    if (!nfq_send(s.fd, 0, NFNL_SUBSYS_QUEUE, NFQNL_MSG_CONFIG, queue, &cmd, sizeof(cmd),
+                  NFQA_CFG_CMD)) {
+        ::close(s.fd);
+        s.fd = -1;
+        return false;
+    }
+
+    nfqnl_msg_config_params params{};
+    params.copy_range = htonl(0xFFFF);
+    params.copy_mode = NFQNL_COPY_PACKET;
+    if (!nfq_send(s.fd, 0, NFNL_SUBSYS_QUEUE, NFQNL_MSG_CONFIG, queue, &params, sizeof(params),
+                  NFQA_CFG_PARAMS)) {
+        ::close(s.fd);
+        s.fd = -1;
+        return false;
+    }
+    return true;
+}
+
+bool nfq_verdict(int fd, uint16_t queue, uint32_t packet_id, uint32_t verdict) {
+    nfqnl_msg_verdict_hdr vh{};
+    vh.verdict = htonl(verdict);
+    vh.id = htonl(packet_id);
+    return nfq_send(fd, 0, NFNL_SUBSYS_QUEUE, NFQNL_MSG_VERDICT, queue, &vh, sizeof(vh),
+                    NFQA_VERDICT_HDR);
+}
+
+void icmp_nfq_loop() {
+    NfqSession nfq;
+    if (!nfq_open(nfq, kIcmpQueueNum)) {
+        log_line("[-] ICMP NFQUEUE open failed (ping divert disabled; need CAP_NET_ADMIN)");
+        return;
+    }
+    g_nfq_fd = nfq.fd;
+    log_line("[*] ICMP NFQUEUE q=" + std::to_string(kIcmpQueueNum) +
+             " (IPv4/ICMPv6 echo-request → rules → DIRECT accept / PROXY CMD_ICMP)");
+
+    uint8_t buf[65536];
+    while (g_run.load()) {
+        pollfd pfd{};
+        pfd.fd = nfq.fd;
+        pfd.events = POLLIN;
+        const int pr = ::poll(&pfd, 1, 200);
+        if (!g_run.load()) break;
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) continue;
+        const ssize_t nr = ::recv(nfq.fd, buf, sizeof(buf), 0);
+        if (nr < static_cast<ssize_t>(NLMSG_HDRLEN + sizeof(nfgenmsg))) continue;
+        uint32_t left = static_cast<uint32_t>(nr);
+
+        for (nlmsghdr* nlh = reinterpret_cast<nlmsghdr*>(buf); NLMSG_OK(nlh, left);
+             nlh = NLMSG_NEXT(nlh, left)) {
+            if (nlh->nlmsg_type == NLMSG_ERROR || nlh->nlmsg_type == NLMSG_DONE) continue;
+            const uint16_t type = nlh->nlmsg_type;
+            const uint8_t subsys = static_cast<uint8_t>(type >> 8);
+            const uint8_t msg = static_cast<uint8_t>(type & 0xff);
+            if (subsys != NFNL_SUBSYS_QUEUE || msg != NFQNL_MSG_PACKET) continue;
+
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(NLMSG_DATA(nlh));
+            size_t rem = nlh->nlmsg_len - NLMSG_HDRLEN;
+            if (rem < sizeof(nfgenmsg)) continue;
+            p += NLMSG_ALIGN(sizeof(nfgenmsg));
+            rem -= NLMSG_ALIGN(sizeof(nfgenmsg));
+
+            uint32_t packet_id = 0;
+            const uint8_t* payload = nullptr;
+            size_t payload_len = 0;
+            while (rem >= sizeof(nlattr)) {
+                const auto* nla = reinterpret_cast<const nlattr*>(p);
+                if (nla->nla_len < sizeof(nlattr) || nla->nla_len > rem) break;
+                const uint16_t at = nla->nla_type & NLA_TYPE_MASK;
+                const uint8_t* ad = p + NLA_HDRLEN;
+                const size_t al = nla->nla_len - NLA_HDRLEN;
+                if (at == NFQA_PACKET_HDR && al >= sizeof(nfqnl_msg_packet_hdr)) {
+                    const auto* ph = reinterpret_cast<const nfqnl_msg_packet_hdr*>(ad);
+                    packet_id = ntohl(ph->packet_id);
+                } else if (at == NFQA_PAYLOAD && al > 0) {
+                    payload = ad;
+                    payload_len = al;
+                }
+                const size_t step = NLA_ALIGN(nla->nla_len);
+                p += step;
+                rem -= step;
+            }
+            if (!payload || packet_id == 0) continue;
+
+            bool accept = true;
+            if (payload_len >= 40 && (payload[0] >> 4) == 6) {
+                accept = decide_icmp_packet_v6(payload, payload_len);
+            } else if (payload_len >= 20 && (payload[0] >> 4) == 4) {
+                accept = decide_icmp_packet_v4(payload, payload_len);
+            }
+            nfq_verdict(nfq.fd, nfq.queue, packet_id, accept ? NF_ACCEPT : NF_DROP);
+        }
+    }
+    if (nfq.fd >= 0) {
+        ::close(nfq.fd);
+        if (g_nfq_fd == nfq.fd) g_nfq_fd = -1;
+    }
+}
+
 std::string default_outbound_iface() {
     FILE* fp = popen((ip_bin() + " -4 route show default 2>/dev/null").c_str(), "r");
     if (!fp) return {};
@@ -1523,6 +2191,21 @@ void hijack_uninstall() {
         run_cmd(ipt + " -t nat -X VORTEX_TCP 2>/dev/null");
         run_cmd(ipt + " -t filter -F VORTEX_FILTER 2>/dev/null");
         run_cmd(ipt + " -t filter -X VORTEX_FILTER 2>/dev/null");
+        for (int i = 0; i < 5; ++i) {
+            if (run_cmd(ipt + " -t mangle -D OUTPUT -j VORTEX_ICMP 2>/dev/null") != 0) break;
+        }
+        run_cmd(ipt + " -t mangle -F VORTEX_ICMP 2>/dev/null");
+        run_cmd(ipt + " -t mangle -X VORTEX_ICMP 2>/dev/null");
+        for (int i = 0; i < 5; ++i) {
+            if (run_cmd("ip6tables -t nat -D OUTPUT -j VORTEX_OUT6 2>/dev/null") != 0) break;
+        }
+        run_cmd("ip6tables -t nat -F VORTEX_OUT6 2>/dev/null");
+        run_cmd("ip6tables -t nat -X VORTEX_OUT6 2>/dev/null");
+        for (int i = 0; i < 5; ++i) {
+            if (run_cmd("ip6tables -t mangle -D OUTPUT -j VORTEX_ICMP6 2>/dev/null") != 0) break;
+        }
+        run_cmd("ip6tables -t mangle -F VORTEX_ICMP6 2>/dev/null");
+        run_cmd("ip6tables -t mangle -X VORTEX_ICMP6 2>/dev/null");
         run_cmd(ip + " addr del 198.18.0.1/15 dev lo 2>/dev/null");
         const std::string iface = default_outbound_iface();
         if (!iface.empty() && ::access("/usr/bin/resolvectl", X_OK) == 0) {
@@ -1582,10 +2265,38 @@ bool hijack_install() {
     run_cmd(ipt + " -t nat -A VORTEX_OUT -d 172.16.0.0/12 -j RETURN");
     run_cmd(ipt + " -t nat -A VORTEX_OUT -d 192.168.0.0/16 -j RETURN");
     run_cmd(ipt + " -t nat -A VORTEX_OUT -d 169.254.0.0/16 -j RETURN");
-    // Uplink excludes (internet_self::is_uplink_ipv4 → reinject).
+    // Uplink excludes (IPv4 iptables; IPv6 uplinks need ip6tables — see note below).
     for (const auto& kv : linux_router::g_cfg.links) {
-        run_cmd(ipt + " -t nat -A VORTEX_OUT -d " + kv.second.server_ip + " -j RETURN");
-        run_cmd(ipt + " -t filter -A VORTEX_FILTER -d " + kv.second.server_ip + " -j RETURN");
+        for (const auto& host : kv.second.uplink_hosts()) {
+            in_addr v4{};
+            if (inet_pton(AF_INET, host.c_str(), &v4) != 1) continue;
+            run_cmd(ipt + " -t nat -A VORTEX_OUT -d " + host + " -j RETURN");
+            run_cmd(ipt + " -t filter -A VORTEX_FILTER -d " + host + " -j RETURN");
+        }
+    }
+    // Best-effort IPv6 uplink exclude + loopback/ULA RETURN (transparent IPv6
+    // REDIRECT is not fully implemented; these RETURN rules avoid hijacking
+    // our own dual-stack uplinks when ip6tables is present).
+    {
+        const std::string ip6t = "ip6tables";
+        run_cmd(ip6t + " -t nat -N VORTEX_OUT6 2>/dev/null || " + ip6t +
+                " -t nat -F VORTEX_OUT6 2>/dev/null");
+        run_cmd(ip6t + " -t nat -D OUTPUT -j VORTEX_OUT6 2>/dev/null");
+        run_cmd(ip6t + " -t nat -I OUTPUT 1 -j VORTEX_OUT6 2>/dev/null");
+        run_cmd(ip6t + " -t nat -F VORTEX_OUT6 2>/dev/null");
+        run_cmd(ip6t + " -t nat -A VORTEX_OUT6 -m mark --mark " + mark +
+                " -j RETURN 2>/dev/null");
+        run_cmd(ip6t + " -t nat -A VORTEX_OUT6 -d ::1/128 -j RETURN 2>/dev/null");
+        run_cmd(ip6t + " -t nat -A VORTEX_OUT6 -d fc00::/7 -j RETURN 2>/dev/null");
+        run_cmd(ip6t + " -t nat -A VORTEX_OUT6 -d fe80::/10 -j RETURN 2>/dev/null");
+        for (const auto& kv : linux_router::g_cfg.links) {
+            for (const auto& host : kv.second.uplink_hosts()) {
+                in6_addr v6{};
+                if (inet_pton(AF_INET6, strip_ip_brackets(host).c_str(), &v6) != 1) continue;
+                run_cmd(ip6t + " -t nat -A VORTEX_OUT6 -d " + strip_ip_brackets(host) +
+                        " -j RETURN 2>/dev/null");
+            }
+        }
     }
     // Stand-in range always redirected (collision fake-IP).
     run_cmd(ipt + " -t nat -A VORTEX_OUT -d " + std::string(kStandInCidr) +
@@ -1599,6 +2310,28 @@ bool hijack_install() {
     run_cmd(ipt + " -t filter -A VORTEX_FILTER -p udp --dport 853 -j REJECT --reject-with icmp-port-unreachable");
     run_cmd(ipt + " -t filter -A VORTEX_FILTER -p tcp --dport 853 -j REJECT --reject-with tcp-reset");
 
+    // ICMP echo-request → NFQUEUE (ping diagnostics). --queue-bypass = ACCEPT if no listener.
+    run_cmd(ipt + " -t mangle -N VORTEX_ICMP 2>/dev/null || " + ipt + " -t mangle -F VORTEX_ICMP");
+    run_cmd(ipt + " -t mangle -D OUTPUT -j VORTEX_ICMP 2>/dev/null");
+    run_cmd(ipt + " -t mangle -I OUTPUT 1 -j VORTEX_ICMP");
+    run_cmd(ipt + " -t mangle -F VORTEX_ICMP");
+    run_cmd(ipt + " -t mangle -A VORTEX_ICMP -m mark --mark " + mark + " -j RETURN");
+    run_cmd(ipt + " -t mangle -A VORTEX_ICMP -p icmp --icmp-type echo-request -j NFQUEUE --queue-num " +
+            std::to_string(kIcmpQueueNum) + " --queue-bypass");
+    {
+        const std::string ip6t = "ip6tables";
+        run_cmd(ip6t + " -t mangle -N VORTEX_ICMP6 2>/dev/null || " + ip6t +
+                " -t mangle -F VORTEX_ICMP6 2>/dev/null");
+        run_cmd(ip6t + " -t mangle -D OUTPUT -j VORTEX_ICMP6 2>/dev/null");
+        run_cmd(ip6t + " -t mangle -I OUTPUT 1 -j VORTEX_ICMP6 2>/dev/null");
+        run_cmd(ip6t + " -t mangle -F VORTEX_ICMP6 2>/dev/null");
+        run_cmd(ip6t + " -t mangle -A VORTEX_ICMP6 -m mark --mark " + mark +
+                " -j RETURN 2>/dev/null");
+        // ICMPv6 echo-request (type 128) → same NFQUEUE as IPv4; userspace decides.
+        run_cmd(ip6t + " -t mangle -A VORTEX_ICMP6 -p icmpv6 --icmpv6-type echo-request -j NFQUEUE --queue-num " +
+                std::to_string(kIcmpQueueNum) + " --queue-bypass 2>/dev/null");
+    }
+
     // Do NOT rewrite resolvectl — that survives Ctrl+C poorly (empty DNS after
     // revert; needs manual Wi-Fi reconnect). UDP/53 REDIRECT already catches
     // systemd-resolved's upstream queries (192.168.x.x / 114.x / …).
@@ -1610,6 +2343,7 @@ bool hijack_install() {
     g_hijack_installed = true;
     log_line("[*] divert: UDP/53→:" + std::to_string(kDnsListenPort) +
              "  learned TCP→:" + std::to_string(kTcpListenPort) +
+             "  ICMP NFQUEUE q=" + std::to_string(kIcmpQueueNum) +
              "  unlearned=passthru(reinject)  own mark=" + mark);
     return true;
 }
@@ -1663,6 +2397,7 @@ void wake_shutdown() {
     router_detail::g_running = false;
     if (g_dns_fd >= 0) { ::shutdown(g_dns_fd, SHUT_RDWR); ::close(g_dns_fd); g_dns_fd = -1; }
     if (g_tcp_fd >= 0) { ::shutdown(g_tcp_fd, SHUT_RDWR); ::close(g_tcp_fd); g_tcp_fd = -1; }
+    if (g_nfq_fd >= 0) { ::close(g_nfq_fd); g_nfq_fd = -1; }
 }
 
 void on_signal(int) { wake_shutdown(); }
@@ -1690,6 +2425,7 @@ std::string resolve_data_path(const std::string& p, const std::string& config_pa
 void resolve_multilink_paths(MultilinkConfig& cfg, const std::string& config_path) {
     cfg.rules_path = resolve_data_path(cfg.rules_path, config_path);
     cfg.geoip_cn = resolve_data_path(cfg.geoip_cn, config_path);
+    cfg.geoipv6_cn = resolve_data_path(cfg.geoipv6_cn, config_path);
     cfg.geosite_cn = resolve_data_path(cfg.geosite_cn, config_path);
 }
 
@@ -1777,14 +2513,16 @@ int main(int argc, char** argv) {
     log_line("[*] router SOCKS 127.0.0.1:" + std::to_string(g_cfg.socks5_port) +
              "  links=" + std::to_string(ml.links.size()) +
              "  default=" + ml.default_link);
-    log_line("[*] filter: outbound UDP/53 + learned TCP + QUIC drop; not mark/LAN/uplink/loopback");
+    log_line("[*] filter: outbound UDP/53 + learned TCP + ICMP echo + QUIC drop; not mark/LAN/uplink");
     log_line("[*] self-exclude: SO_MARK " + mark_hex() + " + registered sports + Vortex server IPs");
     log_line("[*] apps: no proxy settings; DNS sticky map; TCP CONNECT(domain) via rules");
+    log_line("[*] ICMP/ICMPv6: NFQUEUE echo-request → rules (DIRECT accept / PROXY CMD_ICMP + inject)");
     log_line("[*] unlearned TCP: never redirected (WinDivert reinject)");
     log_line("[*] Ctrl+C restores iptables/DNS immediately; if stuck: sudo ./scripts/restore-network.sh");
 
     std::thread dns_thr(dns_loop);
     std::thread tcp_thr(tcp_accept_loop);
+    std::thread icmp_thr(icmp_nfq_loop);
 
     auto last_stat = std::chrono::steady_clock::now();
     while (g_run.load()) {
@@ -1801,6 +2539,9 @@ int main(int argc, char** argv) {
                  " tcp_passthru=" + std::to_string(g_tcp_passthru.load()) +
                  " tcp_ok=" + std::to_string(g_tcp_ok.load()) +
                  " tcp_fail=" + std::to_string(g_tcp_fail.load()) +
+                 " icmp_ok=" + std::to_string(g_icmp_ok.load()) +
+                 " icmp_direct=" + std::to_string(g_icmp_direct.load()) +
+                 " icmp_fail=" + std::to_string(g_icmp_fail.load()) +
                  " drop_quic=" + std::to_string(g_drop_quic.load()) +
                  " passthru=" + std::to_string(g_passthru.load()));
     }
@@ -1812,6 +2553,7 @@ int main(int argc, char** argv) {
     linux_router::stop();
     if (dns_thr.joinable()) dns_thr.join();
     if (tcp_thr.joinable()) tcp_thr.join();
+    if (icmp_thr.joinable()) icmp_thr.join();
     net_cleanup();
     log_line("[*] LinuxNetwork stopped (network restored)");
     return 0;

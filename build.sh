@@ -85,6 +85,7 @@ if [[ "${1:-}" == "test" || "${1:-}" == "all" ]]; then
   $CXX $CXXFLAGS tests/test_multilink.cpp -o "tests/test_multilink${EXE}" $LDFLAGS
   $CXX $CXXFLAGS tests/test_peer_protocol.cpp -o "tests/test_peer_protocol${EXE}" $LDFLAGS
   $CXX $CXXFLAGS tests/test_port_forward.cpp -o "tests/test_port_forward${EXE}" $LDFLAGS
+  $CXX $CXXFLAGS tests/test_icmp_relay.cpp -o "tests/test_icmp_relay${EXE}" $LDFLAGS
   echo "[TEST] running unit tests..."
   "./tests/test_core${EXE}"
   "./tests/test_packet_build${EXE}"
@@ -92,6 +93,7 @@ if [[ "${1:-}" == "test" || "${1:-}" == "all" ]]; then
   "./tests/test_multilink${EXE}"
   "./tests/test_peer_protocol${EXE}"
   "./tests/test_port_forward${EXE}"
+  "./tests/test_icmp_relay${EXE}"
 fi
 
 if [[ "${1:-}" == "all" ]]; then

@@ -1,5 +1,5 @@
 {
-  "bind_ip": "0.0.0.0",
+  "bind_ip": ["::", "0.0.0.0"],
   "bind_port": 18881,
   "master_secret": "password1",
   "padding_min": 8,

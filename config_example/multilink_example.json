@@ -1,7 +1,7 @@
 {
   "multilink": {
     "link1": {
-      "server_ip": "1.2.3.4",
+      "server_ip": ["2001:db8::1", "1.2.3.4"],
       "server_port": 18881,
       "master_secret": "password1",
       "padding_min": 8,
@@ -19,7 +19,7 @@
       "max_payload": 32768
     },
     "link3": {
-      "server_ip": "127.0.0.1",
+      "server_ip": ["2001:db8::1", "1.2.3.4"],
       "server_port": 18888,
       "master_secret": "VortexSecureNetwork2026_KeyMix",
       "peer_secret": "test_peer_secret",
@@ -34,6 +34,7 @@
   "listen_backlog": 128,
   "rules_path": "config/multirules.yaml",
   "geoip_cn": "config/geo/geoip-cn.txt",
+  "geoipv6_cn": "config/geo/geoipv6-cn.txt",
   "geosite_cn": "config/geo/geosite-cn.txt",
   "log_decisions": true
 }

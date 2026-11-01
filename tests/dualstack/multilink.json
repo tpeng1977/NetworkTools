@@ -1,0 +1,21 @@
+{
+  "socks5_bind_ip": "::",
+  "socks5_bind_port": 21090,
+  "listen_backlog": 512,
+  "rules_path": "tests/dualstack/rules.yaml",
+  "geoip_cn": "config/geo/geoip-cn.txt",
+  "geoipv6_cn": "config/geo/geoipv6-cn.txt",
+  "geosite_cn": "config/geo/geosite-cn.txt",
+  "log_decisions": false,
+  "multilink": {
+    "link1": {
+      "server_ip": ["::1", "127.0.0.1"],
+      "server_port": 28888,
+      "master_secret": "VortexDualStackTestSecret2026",
+      "padding_min": 4,
+      "padding_max": 24,
+      "idle_timeout_sec": 120,
+      "max_payload": 32768
+    }
+  }
+}

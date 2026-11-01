@@ -178,7 +178,8 @@ socket_t g_listen = INVALID_SOCK;
 bool start(const SmartlinkConfig& cfg) {
     g_cfg = cfg;
     try {
-        router_detail::g_rules.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn);
+        router_detail::g_rules.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn,
+                                    cfg.geoipv6_cn);
     } catch (const std::exception& e) {
         std::cerr << "[-] rules: " << e.what() << "\n";
         return false;

@@ -265,11 +265,19 @@ inline std::vector<PortMapEntry> zip_port_maps(const std::vector<uint16_t>& list
 
 // to_remote (ssh -R): listen on remote_* , target local_*
 // to_local  (ssh -L): listen on local_*  , target remote_*
+inline void strip_forward_host_brackets(std::string& host) {
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
+}
+
 inline PortForwardSpec parse_to_remote_object(const std::string& obj) {
     PortForwardSpec s;
     if (obj.empty()) return s;
     s.listen_ip = json_get_string_in(obj, "remote_ip", "0.0.0.0");
     s.target_ip = json_get_string_in(obj, "local_ip", "127.0.0.1");
+    strip_forward_host_brackets(s.listen_ip);
+    strip_forward_host_brackets(s.target_ip);
     const std::string r = json_array_slice(obj, "remote_ports");
     const std::string l = json_array_slice(obj, "local_ports");
     if (r.empty() && l.empty()) return s;
@@ -287,6 +295,8 @@ inline PortForwardSpec parse_to_local_object(const std::string& obj) {
     if (obj.empty()) return s;
     s.listen_ip = json_get_string_in(obj, "local_ip", "127.0.0.1");
     s.target_ip = json_get_string_in(obj, "remote_ip", "127.0.0.1");
+    strip_forward_host_brackets(s.listen_ip);
+    strip_forward_host_brackets(s.target_ip);
     const std::string r = json_array_slice(obj, "remote_ports");
     const std::string l = json_array_slice(obj, "local_ports");
     if (r.empty() && l.empty()) return s;
@@ -302,22 +312,24 @@ inline PortForwardSpec parse_to_local_object(const std::string& obj) {
 // Wire helpers ----------------------------------------------------------------
 
 inline std::vector<uint8_t> build_connect_target_host(const std::string& host, uint16_t port) {
+    std::string h = host;
+    strip_forward_host_brackets(h);
     std::vector<uint8_t> wire;
     in_addr v4{};
     in6_addr v6{};
-    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) {
+    if (inet_pton(AF_INET, h.c_str(), &v4) == 1) {
         wire.push_back(ATYP_IPV4);
         const uint8_t* p = reinterpret_cast<const uint8_t*>(&v4);
         wire.insert(wire.end(), p, p + 4);
-    } else if (inet_pton(AF_INET6, host.c_str(), &v6) == 1) {
+    } else if (inet_pton(AF_INET6, h.c_str(), &v6) == 1) {
         wire.push_back(ATYP_IPV6);
         const uint8_t* p = reinterpret_cast<const uint8_t*>(&v6);
         wire.insert(wire.end(), p, p + 16);
     } else {
-        if (host.empty() || host.size() > 255) return {};
+        if (h.empty() || h.size() > 255) return {};
         wire.push_back(ATYP_DOMAIN);
-        wire.push_back(static_cast<uint8_t>(host.size()));
-        wire.insert(wire.end(), host.begin(), host.end());
+        wire.push_back(static_cast<uint8_t>(h.size()));
+        wire.insert(wire.end(), h.begin(), h.end());
     }
     wire.push_back(static_cast<uint8_t>((port >> 8) & 0xFF));
     wire.push_back(static_cast<uint8_t>(port & 0xFF));

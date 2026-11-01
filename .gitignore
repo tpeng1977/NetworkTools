@@ -52,6 +52,15 @@
 /tests/peer_sustained_stress
 /tests/port_forward_soak
 /tests/udp_strict_harness
+/tests/test_poll_closed_fd
+/tests/test_dualstack_unit
+/tests/test_icmp_relay
+/tests/test_packet_build
+/tests/dns_tcp_stub
+/tests/dualstack_soak_worker
+/tests/socks5_dns_dual_get
+/tests/socks5_dualstack_get
+/tests/dualstack/logs/
 /tests/repeat_logs/
 /tests/soak_logs/
 

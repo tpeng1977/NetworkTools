@@ -1,0 +1,14 @@
+{
+  "server_ip": ["::1", "127.0.0.1"],
+  "server_port": 28888,
+  "master_secret": "VortexDualStackTestSecret2026",
+  "peer_secret": "dualstack_peer_secret",
+  "padding_min": 4,
+  "padding_max": 24,
+  "idle_timeout_sec": 120,
+  "max_payload": 32768,
+  "workers": 32,
+  "reconnect_ms": 100,
+  "enable_udp": false,
+  "listen_backlog": 256
+}

@@ -153,7 +153,7 @@ int main() {
         return 1;
     }
     rules::Engine eng;
-    eng.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn);
+    eng.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn, cfg.geoipv6_cn);
 
     struct Target {
         const char* host;

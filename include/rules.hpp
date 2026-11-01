@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -31,6 +32,7 @@ enum class Action { Proxy, Direct };
 
 enum class Kind {
     IpCidr,
+    IpCidr6,
     Domain,
     DomainSuffix,
     DomainKeyword,
@@ -44,12 +46,18 @@ struct Cidr {
     uint32_t mask = 0;    // host order
 };
 
+struct Cidr6 {
+    uint8_t network[16]{};
+    int prefix = 0;
+};
+
 struct Rule {
     Kind kind = Kind::Match;
     Action action = Action::Proxy;
     std::string outbound; // when Proxy: "proxy" or named link (link1, ...)
     bool no_resolve = false;
     Cidr cidr{};
+    Cidr6 cidr6{};
     std::string value; // domain / keyword / geo code / geosite name
 };
 
@@ -88,6 +96,51 @@ inline bool cidr_contains(const Cidr& c, uint32_t host_order_ip) {
     return (host_order_ip & c.mask) == c.network;
 }
 
+inline bool parse_cidr6(const std::string& text, Cidr6& out) {
+    const auto slash = text.find('/');
+    if (slash == std::string::npos) return false;
+    std::string ip = text.substr(0, slash);
+    if (ip.size() >= 2 && ip.front() == '[' && ip.back() == ']') {
+        ip = ip.substr(1, ip.size() - 2);
+    }
+    int prefix = 0;
+    try {
+        prefix = std::stoi(text.substr(slash + 1));
+    } catch (...) {
+        return false;
+    }
+    if (prefix < 0 || prefix > 128) return false;
+    in6_addr a{};
+    if (inet_pton(AF_INET6, ip.c_str(), &a) != 1) return false;
+    out.prefix = prefix;
+    std::memcpy(out.network, &a, 16);
+    // Zero host bits beyond prefix.
+    for (int i = 0; i < 16; ++i) {
+        const int bit0 = i * 8;
+        if (bit0 >= prefix) {
+            out.network[i] = 0;
+        } else if (bit0 + 8 > prefix) {
+            const int keep = prefix - bit0;
+            out.network[i] = static_cast<uint8_t>(out.network[i] & (0xFFu << (8 - keep)));
+        }
+    }
+    return true;
+}
+
+inline bool cidr6_contains(const Cidr6& c, const uint8_t ip[16]) {
+    int bits = c.prefix;
+    for (int i = 0; i < 16 && bits > 0; ++i) {
+        if (bits >= 8) {
+            if (ip[i] != c.network[i]) return false;
+            bits -= 8;
+        } else {
+            const uint8_t mask = static_cast<uint8_t>(0xFFu << (8 - bits));
+            return (ip[i] & mask) == (c.network[i] & mask);
+        }
+    }
+    return true;
+}
+
 inline bool is_private_ip(uint32_t host_order_ip) {
     const uint8_t b0 = static_cast<uint8_t>((host_order_ip >> 24) & 0xFF);
     const uint8_t b1 = static_cast<uint8_t>((host_order_ip >> 16) & 0xFF);
@@ -112,6 +165,33 @@ inline bool load_cidr_file(const std::string& path, std::vector<Cidr>& out) {
         if (parse_cidr(line, c)) out.push_back(c);
     }
     return true;
+}
+
+inline bool load_cidr6_file(const std::string& path, std::vector<Cidr6>& out) {
+    std::ifstream in(path);
+    if (!in) return false;
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+        Cidr6 c;
+        if (parse_cidr6(line, c)) out.push_back(c);
+    }
+    return true;
+}
+
+inline bool is_private_ipv6(const uint8_t ip[16]) {
+    // ::1/128
+    static const uint8_t loop[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    if (std::memcmp(ip, loop, 16) == 0) return true;
+    // fc00::/7
+    if ((ip[0] & 0xFE) == 0xFC) return true;
+    // fe80::/10
+    if (ip[0] == 0xFE && (ip[1] & 0xC0) == 0x80) return true;
+    // ::/128
+    static const uint8_t unspec[16] = {};
+    if (std::memcmp(ip, unspec, 16) == 0) return true;
+    return false;
 }
 
 inline bool load_domain_file(const std::string& path, std::unordered_set<std::string>& out) {
@@ -179,9 +259,15 @@ inline bool parse_rule_line(std::string line, Rule& out) {
     }
     if (parts.size() < 3) return false;
 
-    if (type == "ip-cidr") {
-        out.kind = Kind::IpCidr;
-        if (!parse_cidr(parts[1], out.cidr)) return false;
+    if (type == "ip-cidr" || type == "ip-cidr6") {
+        // Clash: IP-CIDR = IPv4, IP-CIDR6 = IPv6. Also accept IPv6 under IP-CIDR.
+        if (type == "ip-cidr6" || parts[1].find(':') != std::string::npos) {
+            out.kind = Kind::IpCidr6;
+            if (!parse_cidr6(parts[1], out.cidr6)) return false;
+        } else {
+            out.kind = Kind::IpCidr;
+            if (!parse_cidr(parts[1], out.cidr)) return false;
+        }
         set_action_at(2);
         return true;
     }
@@ -248,14 +334,21 @@ class Engine {
 public:
     void load(const std::string& rules_path,
               const std::string& geoip_cn_path,
-              const std::string& geosite_cn_path) {
+              const std::string& geosite_cn_path,
+              const std::string& geoipv6_cn_path = {}) {
         rules_.clear();
         cn_cidrs_.clear();
+        cn_cidrs6_.clear();
         cn_domains_.clear();
         load_rules_yaml(rules_path, rules_);
         if (!geoip_cn_path.empty()) {
             if (!load_cidr_file(geoip_cn_path, cn_cidrs_)) {
                 throw std::runtime_error("Cannot open geoip list: " + geoip_cn_path);
+            }
+        }
+        if (!geoipv6_cn_path.empty()) {
+            if (!load_cidr6_file(geoipv6_cn_path, cn_cidrs6_)) {
+                throw std::runtime_error("Cannot open geoipv6 list: " + geoipv6_cn_path);
             }
         }
         if (!geosite_cn_path.empty()) {
@@ -267,6 +360,7 @@ public:
 
     size_t rule_count() const { return rules_.size(); }
     size_t cn_cidr_count() const { return cn_cidrs_.size(); }
+    size_t cn_cidr6_count() const { return cn_cidrs6_.size(); }
     size_t cn_domain_count() const { return cn_domains_.size(); }
 
     // host: domain or dotted IPv4. resolved_ip_host: optional already-resolved IPv4 (host order).
@@ -275,7 +369,11 @@ public:
                     bool has_ip,
                     uint32_t resolved_ip_host,
                     bool allow_dns_resolve) const {
-        const std::string host = to_lower(trim(host_in));
+        std::string host = to_lower(trim(host_in));
+        // Allow "[2001:db8::1]" style literals in rules matching.
+        if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+            host = host.substr(1, host.size() - 2);
+        }
         bool ip_known = has_ip;
         uint32_t ip = resolved_ip_host;
 
@@ -285,9 +383,11 @@ public:
             ip_known = true;
             ip = ntohl(literal.s_addr);
         }
+        in6_addr literal6{};
+        const bool host_is_ipv6 = inet_pton(AF_INET6, host.c_str(), &literal6) == 1;
         // A cached DNS name must still match DOMAIN / GEOSITE rules even when
         // the SOCKS target is already an IPv4 address.
-        const bool is_domain = !host.empty() && !host_is_ip;
+        const bool is_domain = !host.empty() && !host_is_ip && !host_is_ipv6;
 
         for (const Rule& r : rules_) {
             switch (r.kind) {
@@ -314,6 +414,7 @@ public:
                 }
                 break;
             case Kind::IpCidr: {
+                if (host_is_ipv6) break;
                 if (!ensure_ip(is_domain, r.no_resolve, allow_dns_resolve, host, ip_known, ip)) {
                     break;
                 }
@@ -322,7 +423,25 @@ public:
                 }
                 break;
             }
+            case Kind::IpCidr6: {
+                // Literal IPv6 only (no AAAA resolve in rules yet).
+                if (!host_is_ipv6) break;
+                if (cidr6_contains(r.cidr6, reinterpret_cast<const uint8_t*>(&literal6))) {
+                    return {r.action, r.outbound, "IP-CIDR6"};
+                }
+                break;
+            }
             case Kind::GeoIp: {
+                if (host_is_ipv6) {
+                    const uint8_t* v6 = reinterpret_cast<const uint8_t*>(&literal6);
+                    if (r.value == "private" && is_private_ipv6(v6)) {
+                        return {r.action, r.outbound, "GEOIP,private"};
+                    }
+                    if (r.value == "cn" && geoip_cn6_match(v6)) {
+                        return {r.action, r.outbound, "GEOIP,CN"};
+                    }
+                    break;
+                }
                 if (!ensure_ip(is_domain, r.no_resolve, allow_dns_resolve, host, ip_known, ip)) {
                     break;
                 }
@@ -366,6 +485,7 @@ public:
 private:
     std::vector<Rule> rules_;
     std::vector<Cidr> cn_cidrs_;
+    std::vector<Cidr6> cn_cidrs6_;
     std::unordered_set<std::string> cn_domains_;
 
     static bool domain_suffix_match(const std::string& host, const std::string& suffix) {
@@ -390,6 +510,13 @@ private:
     bool geoip_cn_match(uint32_t host_order_ip) const {
         for (const Cidr& c : cn_cidrs_) {
             if (cidr_contains(c, host_order_ip)) return true;
+        }
+        return false;
+    }
+
+    bool geoip_cn6_match(const uint8_t ip[16]) const {
+        for (const Cidr6& c : cn_cidrs6_) {
+            if (cidr6_contains(c, ip)) return true;
         }
         return false;
     }

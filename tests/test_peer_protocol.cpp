@@ -47,6 +47,32 @@ int main() {
     expect(vortex::CMD_FWD_CONFIG == 0x08 && vortex::CMD_UDP_DATA == 0x09 &&
                vortex::CMD_UDP_CLOSE == 0x0A,
            "fwd cmd ids");
+    expect(vortex::CMD_ICMP == 0x0B && vortex::CMD_VIA_PEER_ICMP == 0x0C, "icmp cmd ids");
+
+    // ICMP wire + VIA_PEER_ICMP round-trip (v4 + v6)
+    {
+        uint8_t echo[8] = {8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01};
+        const auto wire = vortex::build_icmp_wire("127.0.0.1", echo, sizeof(echo));
+        expect(!wire.empty() && wire[0] == 1 && wire[1] == vortex::ATYP_IPV4, "icmp wire build");
+        std::string h;
+        std::vector<uint8_t> ic;
+        expect(vortex::parse_icmp_wire(wire, h, ic), "icmp wire parse");
+        expect(h == "127.0.0.1" && ic.size() == 8 && ic[0] == 8, "icmp wire fields");
+        const auto via = vortex::build_via_peer_icmp_payload(secret, wire);
+        std::string sec2;
+        std::vector<uint8_t> wire2;
+        expect(vortex::parse_via_peer_icmp_payload(via, sec2, wire2), "via icmp parse");
+        expect(sec2 == secret && wire2 == wire, "via icmp round-trip");
+
+        uint8_t echo6[8] = {128, 0, 0, 0, 0x56, 0x78, 0x00, 0x02};
+        const auto wire6 = vortex::build_icmp_wire("::1", echo6, sizeof(echo6));
+        expect(!wire6.empty() && wire6[1] == vortex::ATYP_IPV6, "icmp6 wire build");
+        expect(vortex::parse_icmp_wire(wire6, h, ic) && h == "::1" && ic[0] == 128,
+               "icmp6 wire parse");
+        const auto via6 = vortex::build_via_peer_icmp_payload(secret, wire6);
+        expect(vortex::parse_via_peer_icmp_payload(via6, sec2, wire2) && wire2 == wire6,
+               "via icmp6 round-trip");
+    }
 
     if (g_fail) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);

@@ -29,6 +29,28 @@ done
 "$IPT" -t nat -X VORTEX_TCP 2>/dev/null || true
 "$IPT" -t filter -F VORTEX_FILTER 2>/dev/null || true
 "$IPT" -t filter -X VORTEX_FILTER 2>/dev/null || true
+# ICMP/ICMPv6 NFQUEUE (mangle OUTPUT) used by linux_network ping/ping6 diagnostics.
+for _ in 1 2 3 4 5; do
+  "$IPT" -t mangle -D OUTPUT -j VORTEX_ICMP 2>/dev/null || break
+done
+"$IPT" -t mangle -F VORTEX_ICMP 2>/dev/null || true
+"$IPT" -t mangle -X VORTEX_ICMP 2>/dev/null || true
+
+IP6T="${IP6T:-$(command -v ip6tables || true)}"
+IP6T="${IP6T:-/usr/sbin/ip6tables}"
+if [[ -x "$IP6T" ]]; then
+  echo "[*] removing ip6tables VORTEX_OUT6 / VORTEX_ICMP6..."
+  for _ in 1 2 3 4 5; do
+    "$IP6T" -t nat -D OUTPUT -j VORTEX_OUT6 2>/dev/null || break
+  done
+  "$IP6T" -t nat -F VORTEX_OUT6 2>/dev/null || true
+  "$IP6T" -t nat -X VORTEX_OUT6 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    "$IP6T" -t mangle -D OUTPUT -j VORTEX_ICMP6 2>/dev/null || break
+  done
+  "$IP6T" -t mangle -F VORTEX_ICMP6 2>/dev/null || true
+  "$IP6T" -t mangle -X VORTEX_ICMP6 2>/dev/null || true
+fi
 
 for chain_spec in \
   "nat OUTPUT VORTEX_DNS" \

@@ -10,7 +10,10 @@ Supports **Linux**, **Windows**, and **macOS**.
 - Bidirectional independent key streams
 - Random payload padding (anti length fingerprinting)
 - Active-probe defense (non-auth traffic gets an HTTP 404 nginx-style reply)
-- Local SOCKS5 client (IPv4 / domain / IPv6 CONNECT)
+- Dual-stack server listen: `"bind_ip": "::"` (or `"*"`) accepts IPv4 + IPv6; `"0.0.0.0"` stays IPv4-only
+- Dual-stack uplinks: `server_ip: [IPv6, IPv4]` — IPv6 first, timed fallback to IPv4
+- Local SOCKS5 client (IPv4 / domain / IPv6 CONNECT); domain CONNECT prefers AAAA then A
+- DNS-over-TCP (DIRECT / PROXY): A and AAAA queries both forwarded (not A-only)
 - SmartLink: rule-based SOCKS5 (`DIRECT` / single `PROXY`) using Clash-style rules
 - MultiLink: rule-based SOCKS5 with multiple named upstreams (`link1` / `link2` / `DIRECT`)
 - Peer relay: `peer.exe` registers on `server`; multilink links with `peer_secret` use `VIA_PEER` (multilink → server → peer → target)
@@ -136,7 +139,7 @@ Copy templates from `config_example/` into `config/` (local `config/*.json` and 
 
 | Key | Meaning |
 |-----|---------|
-| `bind_ip` | Listen address (`0.0.0.0` = all interfaces) |
+| `bind_ip` | Listen address: string **or** string array. Single `"::"` / `"*"` / `""` → dual-stack (`IPV6_V6ONLY=0`). `"0.0.0.0"` → IPv4-only. Array e.g. `["::","0.0.0.0"]` or `["::1","127.0.0.1"]` → one socket per entry (wildcard `::`/`*` becomes IPv6-only when an IPv4 companion is present so both binds succeed). |
 | `bind_port` | Listen port |
 | `master_secret` | Shared secret (must match client) |
 | `padding_min` / `padding_max` | Random pad bytes per frame |
@@ -227,12 +230,12 @@ smartlink.exe config\smartlink.json
 |-----|---------|
 | (same tunnel keys as `client.json`) | Bind, remote server, secret, padding, timeouts |
 | `rules_path` | Clash-style rules (default `config/rules.yaml`) |
-| `geoip_cn` / `geosite_cn` | Lists for `GEOIP,CN` / `GEOSITE,cn` |
+| `geoip_cn` / `geoipv6_cn` / `geosite_cn` | Lists for `GEOIP,CN` (v4/v6) / `GEOSITE,cn` |
 | `log_decisions` | Log each CONNECT / DNS decision |
 
 ### `multilink` — rules + named uplinks (`link1` / `link2` / …)
 
-Like SmartLink, but each rule can select a named outbound from `config/multilink.json`. DNS over TCP/53 is routed by the **queried name**, not by the resolver IP (so remote DNS from browsers / AP works with DOMAIN rules).
+Like SmartLink, but each rule can select a named outbound from `config/multilink.json`. DNS over TCP/53 is routed by the **queried name**, not by the resolver IP (so remote DNS from browsers / AP works with DOMAIN rules). A and AAAA queries are forwarded as-is on both DIRECT and PROXY paths (browsers typically issue them separately — neither type is dropped). SOCKS CONNECT to a domain prefers IPv6 then falls back to IPv4 (Happy Eyeballs spirit).
 
 ```bat
 multilink.exe config\multilink.json
@@ -240,18 +243,18 @@ multilink.exe config\multilink.json
 
 | Key | Meaning |
 |-----|---------|
-| `multilink.<name>.*` | Per-link Vortex server (`server_ip`, `server_port`, `master_secret`, …) |
+| `multilink.<name>.*` | Per-link Vortex server (`server_ip` string or `[IPv6, IPv4]` array — **IPv6 tried first**, unreachable IPv6 falls back to IPv4; only both failing counts as failure; `server_port`, `master_secret`, …) |
 | `multilink.<name>.peer_secret` | Optional. If set, this link sends `VIA_PEER` so `server` relays via a matching `peer.exe` |
 | `socks5_bind_ip` / `socks5_bind_port` | Local SOCKS5 listen address |
 | `rules_path` | Clash-style rules (default `config/multirules.yaml`) |
-| `geoip_cn` / `geosite_cn` | Geo lists |
+| `geoip_cn` / `geoipv6_cn` / `geosite_cn` | Geo lists (`GEOIP,CN` uses v4 + v6) |
 | `log_decisions` | Log each CONNECT / DNS decision |
 
 Outbound names in rules: `DIRECT`, `link1`, `link2`, `link3`, … (must match keys under `multilink`). Example templates: `config_example/multilink_example.json`, `config_example/peer_example.json`.
 
 ### Shared rule syntax
 
-Supported types: `IP-CIDR`, `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `GEOIP` (`private` / `CN`), `GEOSITE` (`cn`), `MATCH`. First match wins. `no-resolve` skips DNS when matching IP rules against a domain. SmartLink actions are `DIRECT` / `PROXY`; MultiLink actions are `DIRECT` / named link.
+Supported types: `IP-CIDR`, `IP-CIDR6`, `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `GEOIP` (`private` / `CN`), `GEOSITE` (`cn`), `MATCH`. First match wins. `no-resolve` skips DNS when matching IP rules against a domain. SmartLink actions are `DIRECT` / `PROXY`; MultiLink actions are `DIRECT` / named link.
 
 ## ActivateNet — this PC, no app proxy settings
 
@@ -387,6 +390,7 @@ Decision tree matches `internet.cpp`:
 - **Learned** TCP → REDIRECT → SOCKS5 **CONNECT(domain)** only
 - **Unlearned** TCP → not redirected (WinDivert reinject equivalent)
 - UDP/443 + UDP/853 rejected so stacks fall back to TCP
+- **ICMP / ICMPv6 echo** (`ping` / `ping6`): `iptables` + `ip6tables` NFQUEUE (`VORTEX_ICMP` / `VORTEX_ICMP6`) → same rules as TCP; **DIRECT** accepts on-wire; named link / peer uses Vortex `CMD_ICMP` / `CMD_VIA_PEER_ICMP` (ATYP_IPV4 or ATYP_IPV6), exit with raw ICMP(v6), inject reply so diagnostics see RTT
 
 ```bash
 # Linux only (root for transparent mode)
@@ -395,9 +399,13 @@ sudo ./linux_network config/internet.json
 
 # SOCKS-only (no iptables): same MultiLink router
 ./linux_network --router-only config/internet.json
+
+# ICMP unit + optional live path
+./tests/run_icmp.sh
+sudo ./tests/run_icmp.sh --full
 ```
 
-Config: same `config/internet.json` shape as multilink / Windows Internet (`rules_path`, `geoip_cn`, `geosite_cn`, links, secrets).
+Config: same `config/internet.json` shape as multilink / Windows Internet (`rules_path`, `geoip_cn`, `geoipv6_cn`, `geosite_cn`, links, secrets). No extra ICMP switch (always on in transparent mode; `--queue-bypass` if NFQUEUE listener missing).
 
 If stop leaves DNS/routing broken:
 
@@ -407,25 +415,110 @@ sudo ./scripts/restore-network.sh
 
 ### Relocatable systemd package
 
-```bash
-make dist-linux    # → dist/VortexInternetLinux/ (gitignored)
-```
-
-Copy that folder anywhere, then:
+See **[Release packages](#release-packages-dist)** → `dist/VortexInternetLinux/`. Short path:
 
 ```bash
-cd /path/to/VortexInternetLinux
-sudo ./install-service.sh      # enable + start vortex-linux-network
-sudo ./uninstall-service.sh    # stop, remove unit, restore network
+make -B linux_network && make dist-linux
+# or: ./scripts/pack-vortex-internet-linux.sh
 ```
-
-`install-service.sh` rewrites unit paths from its own directory (safe to relocate). Logs: `journalctl -u vortex-linux-network -f`.
 
 Docker smoke test (privileged, isolated netns):
 
 ```bash
 ./scripts/test-linux-network.sh --docker
 ```
+
+## Release packages (`dist/`)
+
+`dist/` is **gitignored** — folders appear only after you run the pack/stage commands below. Each package is self-contained for deploy; local `config/*.json` secrets stay out of git (use `config_example/` templates).
+
+| Package | Host | How to generate | Output |
+|---------|------|-----------------|--------|
+| **VortexInternetLinux** | Linux | `make -B linux_network && make dist-linux` (or `./scripts/pack-vortex-internet-linux.sh`) | `dist/VortexInternetLinux/` |
+| **portable-linux** | Linux (glibc ≤ 2.35) | `./build-portable.sh` | `dist/portable-linux/` |
+| **VortexInternet** | Windows | `internet-service.bat stage` | `dist\VortexInternet\` |
+| **VortexInternetAndroid** | Android | `build-android.bat` | `dist\VortexInternetAndroid\vortex-internet.apk` |
+
+### `dist/VortexInternetLinux/` — systemd transparent proxy
+
+Relocatable package of `linux_network` + config + install/restore helpers (Makefile target `dist-linux` calls `scripts/pack-vortex-internet-linux.sh`).
+
+```bash
+# From repo root (Linux). -B forces a fresh binary before packing.
+make -B linux_network && make dist-linux
+
+# Equivalent (script builds linux_network if missing):
+./scripts/pack-vortex-internet-linux.sh
+```
+
+**Requires** tracked geo under `config/geo/` (`geoip-cn.txt`, `geoipv6-cn.txt`, `geosite-cn.txt`) and local (gitignored) `config/internet.json` + `config/multirules.yaml` — copy from `config_example/` first if needed.
+
+**Contents:**
+
+| Path | Role |
+|------|------|
+| `linux_network` | Binary |
+| `config/internet.json` | Runtime config (from repo `config/`) |
+| `config/multirules.yaml` | Rules |
+| `config/geo/{geoip,geoipv6,geosite}-cn.txt` | Geo lists |
+| `install-service.sh` / `uninstall-service.sh` | systemd enable/remove |
+| `vortex-linux-network.service` | Unit template (`__ROOT__` filled at install) |
+| `restore-network.sh` / `restore-network-settings.sh` | Emergency network restore |
+| `README.txt` | Package-local notes |
+
+**Install / verify:**
+
+```bash
+# Copy the folder anywhere, then:
+cd /path/to/VortexInternetLinux
+sudo ./install-service.sh          # enable + start vortex-linux-network
+systemctl status vortex-linux-network
+journalctl -u vortex-linux-network -f
+
+# Smoke: DNS + TCP through transparent path (host must have uplink)
+ping -c1 8.8.8.8
+getent hosts example.com
+
+# Tear down
+sudo ./uninstall-service.sh        # stop, remove unit, restore iptables/DNS
+# or emergency: sudo ./restore-network.sh
+```
+
+`install-service.sh` rewrites unit paths from its own directory. After moving the folder, uninstall then re-install.
+
+### `dist/portable-linux/` — glibc-portable CLI binaries
+
+Docker build on `ubuntu:22.04` so binaries run on older deploy hosts (see [Portable Linux](#portable-linux-ubuntu-2204--glibc--235)):
+
+```bash
+./build-portable.sh
+# → dist/portable-linux/{server,client,smartlink,multilink,local,peer,linux_network}
+
+./build-portable.sh --verify-only dist/portable-linux/server
+objdump -T dist/portable-linux/server | grep -oE 'GLIBC_[0-9.]+' | sort -Vu
+```
+
+This is **binaries only** (no systemd unit). For a full transparent-proxy service tree, use `VortexInternetLinux` (optionally replace its `linux_network` with the portable build).
+
+### `dist/VortexInternet/` — Windows Internet service
+
+```bat
+REM Repo root; builds/stages internet.exe + WinDivert + MinGW runtime DLLs + config
+internet-service.bat stage
+internet-service.bat install
+internet-service.bat status
+```
+
+Details: [Windows service](#windows-service-win1011).
+
+### `dist/VortexInternetAndroid/` — APK
+
+```bat
+build-android.bat
+adb install -r dist\VortexInternetAndroid\vortex-internet.apk
+```
+
+Needs JDK 17+ and Android SDK. Details: [Android VPN](#android-vpn-vpnservice) and `src/android/README.md`.
 
 ## Android VPN (VpnService)
 
@@ -528,11 +621,12 @@ src/linux_network.cpp  Linux MultiLink + redir-host (iptables; internet.exe equi
 src/android/           Android VpnService client (Gradle; see src/android/README.md)
 config/                Local JSON/YAML (gitignored) + geo/
 config_example/        Checked-in config templates
-dist/                  Runtime install tree (gitignored; Win/Android/Linux packages)
-scripts/               Linux pack/install/restore + e2e test helpers
+dist/                  Runtime install tree (gitignored) — see Release packages
+scripts/               pack-vortex-internet-linux.sh + install/restore + e2e helpers
 internet-service.bat|.ps1  Stage dist\VortexInternet + Windows service control
 build-android.bat      Build Android APK → dist\VortexInternetAndroid\
-make dist-linux        Stage dist/VortexInternetLinux (relocatable systemd package)
+build-portable.sh      Docker Ubuntu 22.04 → dist/portable-linux/
+make dist-linux        Stage dist/VortexInternetLinux (→ scripts/pack-vortex-internet-linux.sh)
 only-ap.bat|.ps1       Mobile Hotspot only
 start-ap2socks5.bat|.ps1  Start/stop ap2socks5 (hotspot must already be up)
 enable-ipv6.bat        Re-enable ms_tcpip6 on adapters (Administrator)

@@ -42,7 +42,7 @@ int main() {
 
     rules::Engine eng;
     try {
-        eng.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn);
+        eng.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn, cfg.geoipv6_cn);
     } catch (const std::exception& e) {
         std::cerr << "[-] rules: " << e.what() << "\n";
         return 1;

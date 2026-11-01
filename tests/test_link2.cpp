@@ -105,7 +105,7 @@ int main() {
     if (!net_init()) return 1;
     MultilinkConfig cfg = MultilinkConfig::load("config/multilink.json");
     rules::Engine eng;
-    eng.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn);
+    eng.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn, cfg.geoipv6_cn);
 
     expect(cfg.find_link("link1") != nullptr, "link1 loaded");
     expect(cfg.find_link("link2") != nullptr, "link2 loaded");

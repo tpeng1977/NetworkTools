@@ -1,0 +1,13 @@
+rules:
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR6,::1/128,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
+  - GEOIP,private,DIRECT,no-resolve
+  # DNS dual-stack tests: queried name decides DIRECT vs PROXY (not resolver IP).
+  - DOMAIN-SUFFIX,direct-dns.test,DIRECT
+  - DOMAIN-SUFFIX,proxy-dns.test,PROXY
+  - DOMAIN-SUFFIX,prefer-v6.test,DIRECT
+  - DOMAIN-SUFFIX,fallback-v4.test,DIRECT
+  - DOMAIN-SUFFIX,example.invalid,PROXY
+  - MATCH,PROXY

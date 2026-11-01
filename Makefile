@@ -89,10 +89,14 @@ tests/test_rules$(EXE): tests/test_rules.cpp include/rules.hpp
 tests/test_multilink$(EXE): tests/test_multilink.cpp include/config.hpp include/rules.hpp
 	$(CXX) $(CXXFLAGS) tests/test_multilink.cpp -o $@ $(LDFLAGS)
 
-test: tests/test_core$(EXE) tests/test_rules$(EXE) tests/test_multilink$(EXE) all
+tests/test_dualstack_unit$(EXE): tests/test_dualstack_unit.cpp include/*.hpp
+	$(CXX) $(CXXFLAGS) tests/test_dualstack_unit.cpp -o $@ $(LDFLAGS)
+
+test: tests/test_core$(EXE) tests/test_rules$(EXE) tests/test_multilink$(EXE) tests/test_dualstack_unit$(EXE) all
 	./tests/test_core$(EXE)
 	./tests/test_rules$(EXE)
 	./tests/test_multilink$(EXE)
+	./tests/test_dualstack_unit$(EXE)
 
 clean:
 ifeq ($(OS),Windows_NT)

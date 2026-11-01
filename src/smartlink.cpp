@@ -87,6 +87,19 @@ std::string dns_qname(const uint8_t* msg, size_t len) {
     return rules::to_lower(name);
 }
 
+uint16_t dns_qtype(const uint8_t* msg, size_t len) {
+    if (len < 12) return 0;
+    size_t off = dns_skip_name(msg, len, 12);
+    if (off + 4 > len) return 0;
+    return static_cast<uint16_t>((msg[off] << 8) | msg[off + 1]);
+}
+
+const char* dns_qtype_name(uint16_t qtype) {
+    if (qtype == 1) return "A";
+    if (qtype == 28) return "AAAA";
+    return "OTHER";
+}
+
 void remember_dns_answers(const uint8_t* msg, size_t len, const std::string& qname) {
     if (len < 12 || qname.empty()) return;
     const int qd = (msg[4] << 8) | msg[5];
@@ -136,7 +149,8 @@ std::string system_dns_server() {
         std::string ip = line.substr(11);
         const auto sp = ip.find_first_of(" \t");
         if (sp != std::string::npos) ip.resize(sp);
-        if (!ip.empty() && ip != "127.0.0.1") return ip;
+        if (ip.empty() || ip == "127.0.0.1") continue;
+        return ip;
     }
 #endif
     return "223.5.5.5";
@@ -280,9 +294,56 @@ void relay_proxy_down(std::shared_ptr<Session> s) {
     shutdown_both(s->remote_fd);
 }
 
+// Rebuild Vortex CONNECT as ATYP_DOMAIN so the remote server resolves
+// (local / cached A records are often GFW-poisoned). Align with multilink.
+void prefer_remote_dns_wire(SocksTarget& t, const std::string& domain) {
+    if (domain.empty() || domain.size() > 255) return;
+    if (host_is_ipv4_literal(domain) || host_is_ipv6_literal(domain)) return;
+    t.atyp = vortex::ATYP_DOMAIN;
+    t.host = domain;
+    t.has_ipv4 = false;
+    t.ipv4_host = 0;
+    t.wire.clear();
+    t.wire.push_back(vortex::ATYP_DOMAIN);
+    t.wire.push_back(static_cast<uint8_t>(domain.size()));
+    t.wire.insert(t.wire.end(), domain.begin(), domain.end());
+    t.wire.push_back(static_cast<uint8_t>(t.port >> 8));
+    t.wire.push_back(static_cast<uint8_t>(t.port & 0xFF));
+}
+
+void log_uplink_connect(const SmartlinkConfig& cfg, const ConnectHostsDetail& detail, bool ok) {
+    if (!ok) {
+        log_line("[-] uplink TCP failed " +
+                 format_hosts_port(cfg.uplink_hosts(), cfg.server_port));
+        return;
+    }
+    if (!detail.failed_hosts.empty()) {
+        std::string failed;
+        for (size_t i = 0; i < detail.failed_hosts.size(); ++i) {
+            if (i) failed += ",";
+            failed += detail.failed_hosts[i];
+            failed += "(";
+            failed += host_family_tag(detail.failed_hosts[i]);
+            failed += ")";
+        }
+        log_line("[*] uplink fallback failed=[" + failed + "] ok=" +
+                 format_host_port(detail.used_host, cfg.server_port) + "(" +
+                 host_family_tag(detail.used_host) + ")");
+    } else if (cfg.uplink_hosts().size() > 1) {
+        log_line("[+] uplink " + format_host_port(detail.used_host, cfg.server_port) + "(" +
+                 host_family_tag(detail.used_host) + ")");
+    }
+}
+
 bool open_proxy(std::shared_ptr<Session> s, const SocksTarget& t) {
-    socket_t remote_fd = tcp_connect(s->cfg.server_ip, s->cfg.server_port, s->cfg.idle_timeout_sec);
-    if (remote_fd == INVALID_SOCK) return false;
+    ConnectHostsDetail detail;
+    socket_t remote_fd = tcp_connect_hosts(s->cfg.uplink_hosts(), s->cfg.server_port,
+                                           s->cfg.idle_timeout_sec, &detail);
+    if (remote_fd == INVALID_SOCK) {
+        log_uplink_connect(s->cfg, detail, false);
+        return false;
+    }
+    log_uplink_connect(s->cfg, detail, true);
     s->remote_fd = remote_fd;
     s->via_proxy = true;
 
@@ -302,17 +363,12 @@ bool open_proxy(std::shared_ptr<Session> s, const SocksTarget& t) {
     return reply.ok && reply.cmd == vortex::CMD_CONNECT_OK;
 }
 
-bool dns_query_direct(const uint8_t* query, size_t qlen, std::vector<uint8_t>& answer) {
-    const std::string dns = system_dns_server();
-    socket_t fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+bool dns_query_udp(const std::string& dns, const uint8_t* query, size_t qlen,
+                   std::vector<uint8_t>& answer) {
+    const std::string bare = strip_ip_brackets(dns);
+    const bool v6 = host_is_ipv6_literal(bare);
+    socket_t fd = ::socket(v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd == INVALID_SOCK) return false;
-    sockaddr_in dst{};
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(53);
-    if (inet_pton(AF_INET, dns.c_str(), &dst.sin_addr) != 1) {
-        net_close(fd);
-        return false;
-    }
 #ifdef _WIN32
     DWORD ms = 3000;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&ms), sizeof(ms));
@@ -321,17 +377,50 @@ bool dns_query_direct(const uint8_t* query, size_t qlen, std::vector<uint8_t>& a
     tv.tv_sec = 3;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
-    if (sendto(fd, reinterpret_cast<const char*>(query), static_cast<int>(qlen), 0,
-               reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) < 0) {
-        net_close(fd);
-        return false;
+    if (v6) {
+        sockaddr_in6 dst{};
+        dst.sin6_family = AF_INET6;
+        dst.sin6_port = htons(53);
+        if (inet_pton(AF_INET6, bare.c_str(), &dst.sin6_addr) != 1) {
+            net_close(fd);
+            return false;
+        }
+        if (sendto(fd, reinterpret_cast<const char*>(query), static_cast<int>(qlen), 0,
+                   reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) < 0) {
+            net_close(fd);
+            return false;
+        }
+    } else {
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(53);
+        if (inet_pton(AF_INET, bare.c_str(), &dst.sin_addr) != 1) {
+            net_close(fd);
+            return false;
+        }
+        if (sendto(fd, reinterpret_cast<const char*>(query), static_cast<int>(qlen), 0,
+                   reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) < 0) {
+            net_close(fd);
+            return false;
+        }
     }
     answer.resize(2048);
-    const int n = recvfrom(fd, reinterpret_cast<char*>(answer.data()), static_cast<int>(answer.size()), 0, nullptr, nullptr);
+    const int n = recvfrom(fd, reinterpret_cast<char*>(answer.data()),
+                           static_cast<int>(answer.size()), 0, nullptr, nullptr);
     net_close(fd);
     if (n <= 0) return false;
     answer.resize(static_cast<size_t>(n));
     return true;
+}
+
+bool dns_query_direct(const uint8_t* query, size_t qlen, std::vector<uint8_t>& answer) {
+    return dns_query_udp(system_dns_server(), query, qlen, answer);
+}
+
+bool dns_query_tcp_resolver(const std::string& host, uint16_t port, const uint8_t* query,
+                            size_t qlen, std::vector<uint8_t>& answer) {
+    return dns_tcp_transact_raw(strip_ip_brackets(host), static_cast<int>(port ? port : 53),
+                                query, qlen, answer, 3);
 }
 
 bool dns_query_proxy(std::shared_ptr<Session> s, const SocksTarget& t,
@@ -369,10 +458,12 @@ void handle_dns(std::shared_ptr<Session> s, const SocksTarget& target) {
     if (!recv_exact(s->local_fd, query.data(), qlen)) return;
 
     const std::string name = dns_qname(query.data(), query.size());
+    const uint16_t qtype = dns_qtype(query.data(), query.size());
     const auto decision = g_rules.decide(name.empty() ? target.host : name, false, 0, true);
     if (s->cfg.log_decisions) {
         log_line(std::string("[*] DNS ") + rules::action_name(decision.action) + " " +
-                 (name.empty() ? target.host : name) + "  (" + decision.matched + ")");
+                 (name.empty() ? target.host : name) + " " + dns_qtype_name(qtype) +
+                 "  (" + decision.matched + ")");
     }
 
     std::vector<uint8_t> framed;
@@ -384,7 +475,11 @@ void handle_dns(std::shared_ptr<Session> s, const SocksTarget& target) {
     bool ok = false;
     if (decision.action == rules::Action::Direct) {
         std::vector<uint8_t> answer;
-        ok = dns_query_direct(query.data(), query.size(), answer);
+        if (host_is_ipv4_literal(target.host) || host_is_ipv6_literal(target.host)) {
+            ok = dns_query_tcp_resolver(target.host, target.port, query.data(), query.size(),
+                                        answer);
+        }
+        if (!ok) ok = dns_query_direct(query.data(), query.size(), answer);
         if (ok) {
             out.push_back(static_cast<uint8_t>(answer.size() >> 8));
             out.push_back(static_cast<uint8_t>(answer.size()));
@@ -430,14 +525,13 @@ void handle_socks5(socket_t local_fd, SmartlinkConfig cfg) {
         const std::string learned = cached_name(target.ipv4_host);
         if (!learned.empty()) rule_host = learned;
     }
-    // IPv6: no GEOIP/CN CIDR yet; domain and MATCH still apply. Literal IPv6
-    // falls through domain rules and uses MATCH (usually PROXY).
+    // Literal IPv6 uses IP-CIDR6 / GEOIP,CN(v6) / GEOIP,private; domains resolve A for v4 rules.
     const auto decision = g_rules.decide(
         rule_host, target.has_ipv4, target.ipv4_host, /*allow_dns_resolve=*/true);
 
     if (s->cfg.log_decisions) {
         log_line(std::string("[*] ") + rules::action_name(decision.action) + " " +
-                 target.host + ":" + std::to_string(target.port) +
+                 format_host_port(target.host, target.port) +
                  "  (" + decision.matched + ")");
     }
 
@@ -449,7 +543,11 @@ void handle_socks5(socket_t local_fd, SmartlinkConfig cfg) {
             return;
         }
     } else {
-        ok = open_proxy(s, target);
+        SocksTarget connect_tgt = target;
+        if (!host_is_ipv4_literal(rule_host) && !host_is_ipv6_literal(rule_host)) {
+            prefer_remote_dns_wire(connect_tgt, rule_host);
+        }
+        ok = open_proxy(s, connect_tgt);
         if (!ok) {
             reply_socks_fail(local_fd, 0x01);
             return;
@@ -496,7 +594,7 @@ int main(int argc, char* argv[]) {
     SmartlinkConfig cfg;
     try {
         cfg = SmartlinkConfig::load(config_path);
-        g_rules.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn);
+        g_rules.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn, cfg.geoipv6_cn);
     } catch (const std::exception& e) {
         std::cerr << "[-] " << e.what() << "\n";
         net_cleanup();
@@ -519,21 +617,20 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "[*] SmartLink SOCKS5 on "
-              << cfg.socks5_bind_ip << ":" << cfg.socks5_bind_port << std::endl;
-    std::cout << "[*] Upstream " << cfg.server_ip << ":" << cfg.server_port
+              << format_host_port(cfg.socks5_bind_ip, cfg.socks5_bind_port) << std::endl;
+    std::cout << "[*] Upstream " << format_hosts_port(cfg.uplink_hosts(), cfg.server_port)
               << "  padding=[" << cfg.padding_min << "," << cfg.padding_max << "]"
               << std::endl;
     std::cout << "[*] Rules " << cfg.rules_path
               << " (" << g_rules.rule_count() << " entries)"
               << "  GEOIP-CN=" << g_rules.cn_cidr_count()
+              << "  GEOIP-CN6=" << g_rules.cn_cidr6_count()
               << "  GEOSITE-CN=" << g_rules.cn_domain_count()
               << std::endl;
     std::cout.flush();
 
     while (g_running) {
-        sockaddr_in peer{};
-        socklen_type peer_len = sizeof(peer);
-        socket_t local_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        socket_t local_fd = accept_any(listen_fd);
         if (local_fd == INVALID_SOCK) {
             if (!g_running) break;
             continue;

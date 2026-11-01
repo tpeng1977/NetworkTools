@@ -51,18 +51,20 @@ inline void unregister_port(uint16_t sport) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_sports.erase(sport);
 }
-inline void register_socket(socket_t s) {
-    sockaddr_in a{};
-    socklen_type alen = sizeof(a);
-    if (getsockname(s, reinterpret_cast<sockaddr*>(&a), &alen) != 0) return;
-    register_port(ntohs(a.sin_port));
+inline uint16_t socket_local_port(socket_t s) {
+    sockaddr_storage ss{};
+    socklen_type alen = sizeof(ss);
+    if (getsockname(s, reinterpret_cast<sockaddr*>(&ss), &alen) != 0) return 0;
+    if (ss.ss_family == AF_INET) {
+        return ntohs(reinterpret_cast<sockaddr_in*>(&ss)->sin_port);
+    }
+    if (ss.ss_family == AF_INET6) {
+        return ntohs(reinterpret_cast<sockaddr_in6*>(&ss)->sin6_port);
+    }
+    return 0;
 }
-inline void unregister_socket(socket_t s) {
-    sockaddr_in a{};
-    socklen_type alen = sizeof(a);
-    if (getsockname(s, reinterpret_cast<sockaddr*>(&a), &alen) != 0) return;
-    unregister_port(ntohs(a.sin_port));
-}
+inline void register_socket(socket_t s) { register_port(socket_local_port(s)); }
+inline void unregister_socket(socket_t s) { unregister_port(socket_local_port(s)); }
 inline bool is_own_sport(uint16_t sport) {
     std::lock_guard<std::mutex> lock(g_mu);
     return g_sports.count(sport) != 0;
@@ -220,26 +222,47 @@ std::string system_dns_server() {
 // Bind ephemeral port, register with divert self-exclude, then connect.
 socket_t tcp_connect_registered(const std::string& host, int port, int idle_timeout_sec) {
     addrinfo hints{};
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
     addrinfo* res = nullptr;
-    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
+    const std::string host_norm = strip_ip_brackets(host);
+    if (getaddrinfo(host_norm.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
         return INVALID_SOCK;
     }
-    socket_t fd = INVALID_SOCK;
+    // Prefer IPv6 results when both families are returned for one host.
+    std::vector<addrinfo*> ordered;
     for (addrinfo* p = res; p; p = p->ai_next) {
+        if (p->ai_family == AF_INET6) ordered.push_back(p);
+    }
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        if (p->ai_family != AF_INET6) ordered.push_back(p);
+    }
+    socket_t fd = INVALID_SOCK;
+    for (addrinfo* p : ordered) {
         fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd == INVALID_SOCK) continue;
         set_socket_options(fd, idle_timeout_sec);
-        sockaddr_in local{};
-        local.sin_family = AF_INET;
-        local.sin_addr.s_addr = htonl(INADDR_ANY);
-        local.sin_port = 0;
-        if (::bind(fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
-            net_close(fd);
-            fd = INVALID_SOCK;
-            continue;
+        if (p->ai_family == AF_INET6) {
+            sockaddr_in6 local6{};
+            local6.sin6_family = AF_INET6;
+            local6.sin6_addr = in6addr_any;
+            local6.sin6_port = 0;
+            if (::bind(fd, reinterpret_cast<sockaddr*>(&local6), sizeof(local6)) != 0) {
+                net_close(fd);
+                fd = INVALID_SOCK;
+                continue;
+            }
+        } else {
+            sockaddr_in local{};
+            local.sin_family = AF_INET;
+            local.sin_addr.s_addr = htonl(INADDR_ANY);
+            local.sin_port = 0;
+            if (::bind(fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+                net_close(fd);
+                fd = INVALID_SOCK;
+                continue;
+            }
         }
         internet_self::register_socket(fd);
         if (::connect(fd, p->ai_addr, static_cast<socklen_type>(p->ai_addrlen)) == 0) break;
@@ -251,17 +274,31 @@ socket_t tcp_connect_registered(const std::string& host, int port, int idle_time
     return fd;
 }
 
+socket_t tcp_connect_registered_hosts(const std::vector<std::string>& hosts, int port,
+                                      int idle_timeout_sec) {
+    for (const auto& h : hosts) {
+        if (h.empty()) continue;
+        socket_t fd = tcp_connect_registered(h, port, idle_timeout_sec);
+        if (fd != INVALID_SOCK) return fd;
+    }
+    return INVALID_SOCK;
+}
+
+// DIRECT egress: dual-stack DNS-over-TCP (AAAA then A), IPv6-first connect.
+// Matches multilink tcp_connect_direct_host / linux_network marked path.
 socket_t tcp_connect_direct_registered(const std::string& host, int port, int idle_timeout_sec) {
     in_addr lit{};
     if (inet_pton(AF_INET, host.c_str(), &lit) == 1) {
         return tcp_connect_registered(host, port, idle_timeout_sec);
     }
-    uint32_t ip_net = 0;
-    if (resolve_ipv4_dns_tcp(host, ip_net)) {
-        char buf[INET_ADDRSTRLEN] = {};
-        if (inet_ntop(AF_INET, &ip_net, buf, sizeof(buf))) {
-            return tcp_connect_registered(buf, port, idle_timeout_sec);
-        }
+    in6_addr lit6{};
+    if (inet_pton(AF_INET6, strip_ip_brackets(host).c_str(), &lit6) == 1) {
+        return tcp_connect_registered(strip_ip_brackets(host), port, idle_timeout_sec);
+    }
+    std::vector<std::string> hosts;
+    if (resolve_hosts_dns_tcp(host, hosts)) {
+        socket_t fd = tcp_connect_registered_hosts(hosts, port, idle_timeout_sec);
+        if (fd != INVALID_SOCK) return fd;
     }
     return tcp_connect_registered(host, port, idle_timeout_sec);
 }
@@ -428,10 +465,11 @@ void prefer_remote_dns_wire(SocksTarget& t, const std::string& domain) {
 
 bool open_proxy(std::shared_ptr<Session> s, const SocksTarget& t) {
     socket_t remote_fd =
-        tcp_connect_registered(s->link.server_ip, s->link.server_port, s->idle_timeout_sec);
+        tcp_connect_registered_hosts(s->link.uplink_hosts(), s->link.server_port,
+                                     s->idle_timeout_sec);
     if (remote_fd == INVALID_SOCK) {
-        log_line("[-] uplink TCP failed " + s->link.name + " " + s->link.server_ip + ":" +
-                 std::to_string(s->link.server_port));
+        log_line("[-] uplink TCP failed " + s->link.name + " " +
+                 format_hosts_port(s->link.uplink_hosts(), s->link.server_port));
         return false;
     }
     s->remote_fd = remote_fd;
@@ -670,7 +708,8 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
                  "  (" + decision.matched + ")" +
                  (link.name.empty()
                       ? ""
-                      : " via " + link.name + " " + link.server_ip +
+                      : " via " + link.name + " " +
+                            format_hosts_port(link.uplink_hosts(), link.server_port) +
                             (link.peer_secret.empty() ? "" : " (peer)")));
     }
 
@@ -729,7 +768,8 @@ socket_t g_listen = INVALID_SOCK;
 bool start(const MultilinkConfig& cfg) {
     g_cfg = cfg;
     try {
-        router_detail::g_rules.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn);
+        router_detail::g_rules.load(cfg.rules_path, cfg.geoip_cn, cfg.geosite_cn,
+                                    cfg.geoipv6_cn);
     } catch (const std::exception& e) {
         std::cerr << "[-] rules: " << e.what() << "\n";
         return false;
@@ -742,9 +782,11 @@ bool start(const MultilinkConfig& cfg) {
     }
     internet_self::clear_uplink_ipv4();
     for (const auto& kv : cfg.links) {
-        in_addr up{};
-        if (inet_pton(AF_INET, kv.second.server_ip.c_str(), &up) == 1) {
-            internet_self::add_uplink_ipv4(up.s_addr);
+        for (const auto& host : kv.second.uplink_hosts()) {
+            in_addr up{};
+            if (inet_pton(AF_INET, host.c_str(), &up) == 1) {
+                internet_self::add_uplink_ipv4(up.s_addr);
+            }
         }
     }
     std::thread([] {
@@ -764,7 +806,8 @@ bool start(const MultilinkConfig& cfg) {
               << std::endl;
     for (const auto& kv : cfg.links) {
         const auto& L = kv.second;
-        std::cout << "[*] Link " << L.name << " -> " << L.server_ip << ":" << L.server_port
+        std::cout << "[*] Link " << L.name << " -> "
+                  << format_hosts_port(L.uplink_hosts(), L.server_port)
                   << (L.peer_secret.empty() ? "" : "  peer-relay") << std::endl;
     }
     std::cout << "[*] Default link " << cfg.default_link << std::endl;
@@ -1758,7 +1801,9 @@ void handle_dns(HANDLE divert, DivertAddr addr, uint32_t src, uint16_t sport,
     };
 
     if (qtype != 1) {
-        // AAAA etc. → NODATA so stacks use IPv4 / learned A only (like activate_net).
+        // Transparent divert is IPv4-only (WinDivert filter / learned A). AAAA→NODATA
+        // keeps apps on A → SOCKS CONNECT(domain); router DIRECT then prefers IPv6.
+        // Real AAAA here would bypass PROXY rules on native IPv6.
         inject_dns(dns_reply_nodata(query), "type" + std::to_string(qtype) + "->NODATA", true);
         return;
     }

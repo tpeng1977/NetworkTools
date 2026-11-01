@@ -126,8 +126,8 @@ void handle_socks5(socket_t local_fd, ClientConfig cfg) {
         return;
     }
 
-    socket_t remote_fd = tcp_connect(s->cfg.server_ip, s->cfg.server_port,
-                                     s->cfg.idle_timeout_sec);
+    socket_t remote_fd = tcp_connect_hosts(s->cfg.uplink_hosts(), s->cfg.server_port,
+                                           s->cfg.idle_timeout_sec);
     if (remote_fd == INVALID_SOCK) {
         const uint8_t fail[] = {0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
         send_all(local_fd, fail, sizeof(fail));
@@ -221,16 +221,14 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "[*] Vortex SOCKS5 Client on "
-              << cfg.socks5_bind_ip << ":" << cfg.socks5_bind_port << std::endl;
-    std::cout << "[*] Upstream " << cfg.server_ip << ":" << cfg.server_port
+              << format_host_port(cfg.socks5_bind_ip, cfg.socks5_bind_port) << std::endl;
+    std::cout << "[*] Upstream " << format_hosts_port(cfg.uplink_hosts(), cfg.server_port)
               << "  padding=[" << cfg.padding_min << "," << cfg.padding_max << "]"
               << std::endl;
     std::cout.flush();
 
     while (g_running) {
-        sockaddr_in peer{};
-        socklen_type peer_len = sizeof(peer);
-        socket_t local_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        socket_t local_fd = accept_any(listen_fd);
         if (local_fd == INVALID_SOCK) {
             if (!g_running) break;
             continue;

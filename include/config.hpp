@@ -1,6 +1,7 @@
 #ifndef VORTEX_CONFIG_HPP
 #define VORTEX_CONFIG_HPP
 
+#include <algorithm>
 #include <cctype>
 #include <fstream>
 #include <map>
@@ -9,6 +10,141 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// Allow "[2001:db8::1]" in JSON; store bare form for getaddrinfo / inet_pton.
+inline void normalize_host_ip(std::string& host) {
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
+}
+
+// Literals with ':' sort first (IPv6), then the rest — stable within each group.
+inline void prefer_ipv6_order(std::vector<std::string>& hosts) {
+    std::stable_partition(hosts.begin(), hosts.end(), [](const std::string& h) {
+        return h.find(':') != std::string::npos;
+    });
+}
+
+// Normalize / dedupe / IPv6-prefer a host list; set primary to front.
+inline void finalize_server_ips(std::vector<std::string>& ips, std::string& primary) {
+    if (ips.empty() && !primary.empty()) ips.push_back(primary);
+    for (auto& h : ips) normalize_host_ip(h);
+    std::vector<std::string> uniq;
+    for (const auto& h : ips) {
+        if (h.empty()) continue;
+        if (std::find(uniq.begin(), uniq.end(), h) == uniq.end()) uniq.push_back(h);
+    }
+    ips = std::move(uniq);
+    prefer_ipv6_order(ips);
+    if (!ips.empty()) primary = ips.front();
+    else if (!primary.empty()) {
+        normalize_host_ip(primary);
+        ips.push_back(primary);
+    }
+}
+
+// Parse "key": "h" or "key": ["v6","v4"] from raw JSON text.
+inline std::vector<std::string> parse_ip_list_field(const std::string& text,
+                                                    const std::string& key) {
+    std::vector<std::string> out;
+    const std::string pattern = "\"" + key + "\"";
+    size_t pos = text.find(pattern);
+    if (pos == std::string::npos) return out;
+    pos = text.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return out;
+    ++pos;
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    if (pos >= text.size()) return out;
+    if (text[pos] == '"') {
+        ++pos;
+        std::string s;
+        while (pos < text.size() && text[pos] != '"') {
+            if (text[pos] == '\\' && pos + 1 < text.size()) {
+                s.push_back(text[pos + 1]);
+                pos += 2;
+            } else {
+                s.push_back(text[pos++]);
+            }
+        }
+        // Allow empty string "" as a bind wildcard.
+        out.push_back(std::move(s));
+        return out;
+    }
+    if (text[pos] != '[') return out;
+    int depth = 0;
+    bool in_str = false;
+    size_t end = std::string::npos;
+    for (size_t i = pos; i < text.size(); ++i) {
+        const char ch = text[i];
+        if (in_str) {
+            if (ch == '\\' && i + 1 < text.size()) {
+                ++i;
+                continue;
+            }
+            if (ch == '"') in_str = false;
+            continue;
+        }
+        if (ch == '"') {
+            in_str = true;
+            continue;
+        }
+        if (ch == '[') ++depth;
+        else if (ch == ']') {
+            --depth;
+            if (depth == 0) {
+                end = i;
+                break;
+            }
+        }
+    }
+    if (end == std::string::npos) return out;
+    size_t i = pos + 1;
+    while (i < end) {
+        while (i < end && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+        if (i >= end || text[i] == ']') break;
+        if (text[i] != '"') break;
+        ++i;
+        std::string s;
+        while (i < end && text[i] != '"') {
+            if (text[i] == '\\' && i + 1 < end) {
+                s.push_back(text[i + 1]);
+                i += 2;
+            } else {
+                s.push_back(text[i++]);
+            }
+        }
+        if (i < end && text[i] == '"') ++i;
+        out.push_back(std::move(s));
+        while (i < end && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+        if (i < end && text[i] == ',') ++i;
+    }
+    return out;
+}
+
+inline std::vector<std::string> parse_server_ip_list(const std::string& text) {
+    auto out = parse_ip_list_field(text, "server_ip");
+    // Drop empties for uplink lists (unlike bind_ip wildcards).
+    out.erase(std::remove_if(out.begin(), out.end(),
+                              [](const std::string& s) { return s.empty(); }),
+              out.end());
+    return out;
+}
+
+// Normalize / dedupe bind addresses; keep declaration order (no IPv6-prefer).
+inline void finalize_bind_ips(std::vector<std::string>& ips, std::string& primary) {
+    if (ips.empty() && !primary.empty()) ips.push_back(primary);
+    for (auto& h : ips) normalize_host_ip(h);
+    std::vector<std::string> uniq;
+    for (const auto& h : ips) {
+        if (std::find(uniq.begin(), uniq.end(), h) == uniq.end()) uniq.push_back(h);
+    }
+    ips = std::move(uniq);
+    if (!ips.empty()) primary = ips.front();
+    else if (!primary.empty()) {
+        normalize_host_ip(primary);
+        ips.push_back(primary);
+    }
+}
 
 // Minimal JSON object reader for our flat config files (no nested objects).
 class JsonConfig {
@@ -88,7 +224,11 @@ private:
 };
 
 struct ServerConfig {
+    // Single: "::"/"*"/"\"\"" → dual-stack; "0.0.0.0" → IPv4-only; literals → that family.
+    // Array: e.g. ["::","0.0.0.0"] or ["::1","127.0.0.1"] — one listen socket per entry
+    // (wildcard "::"/"*" in a multi-bind list uses IPV6_V6ONLY=1 so IPv4 companion works).
     std::string bind_ip = "0.0.0.0";
+    std::vector<std::string> bind_ips;
     int bind_port = 18888;
     std::string master_secret = "VortexSecureNetwork2026_KeyMix";
     int padding_min = 0;
@@ -99,10 +239,19 @@ struct ServerConfig {
     int max_payload = 32768;
     int max_connections = 2048;
 
+    const std::vector<std::string>& listen_hosts() const { return bind_ips; }
+
     static ServerConfig load(const std::string& path) {
         JsonConfig j(path);
         ServerConfig c;
-        c.bind_ip = j.get_string("bind_ip", c.bind_ip);
+        {
+            std::ifstream in(path);
+            std::ostringstream ss;
+            if (in) ss << in.rdbuf();
+            c.bind_ips = parse_ip_list_field(ss.str(), "bind_ip");
+        }
+        if (c.bind_ips.empty()) c.bind_ip = j.get_string("bind_ip", c.bind_ip);
+        finalize_bind_ips(c.bind_ips, c.bind_ip);
         c.bind_port = j.get_int("bind_port", c.bind_port);
         c.master_secret = j.get_string("master_secret", c.master_secret);
         c.padding_min = j.get_int("padding_min", c.padding_min);
@@ -124,6 +273,7 @@ struct ClientConfig {
     std::string socks5_bind_ip = "127.0.0.1";
     int socks5_bind_port = 11080;
     std::string server_ip = "127.0.0.1";
+    std::vector<std::string> server_ips;
     int server_port = 18888;
     std::string master_secret = "VortexSecureNetwork2026_KeyMix";
     int padding_min = 0;
@@ -132,12 +282,14 @@ struct ClientConfig {
     int idle_timeout_sec = 300;
     int max_payload = 32768;
 
+    const std::vector<std::string>& uplink_hosts() const { return server_ips; }
+
     static ClientConfig load(const std::string& path) {
         JsonConfig j(path);
         ClientConfig c;
         c.socks5_bind_ip = j.get_string("socks5_bind_ip", c.socks5_bind_ip);
+        normalize_host_ip(c.socks5_bind_ip);
         c.socks5_bind_port = j.get_int("socks5_bind_port", c.socks5_bind_port);
-        c.server_ip = j.get_string("server_ip", c.server_ip);
         c.server_port = j.get_int("server_port", c.server_port);
         c.master_secret = j.get_string("master_secret", c.master_secret);
         c.padding_min = j.get_int("padding_min", c.padding_min);
@@ -145,6 +297,16 @@ struct ClientConfig {
         c.listen_backlog = j.get_int("listen_backlog", c.listen_backlog);
         c.idle_timeout_sec = j.get_int("idle_timeout_sec", c.idle_timeout_sec);
         c.max_payload = j.get_int("max_payload", c.max_payload);
+        {
+            std::ifstream in(path);
+            if (in) {
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                c.server_ips = parse_server_ip_list(ss.str());
+            }
+            if (c.server_ips.empty()) c.server_ip = j.get_string("server_ip", c.server_ip);
+            finalize_server_ips(c.server_ips, c.server_ip);
+        }
         if (c.padding_min < 0) c.padding_min = 0;
         if (c.padding_max < c.padding_min) c.padding_max = c.padding_min;
         if (c.max_payload < 1024) c.max_payload = 1024;
@@ -199,6 +361,7 @@ struct LocalConfig {
         JsonConfig j(path);
         LocalConfig c;
         c.socks5_bind_ip = j.get_string("socks5_bind_ip", c.socks5_bind_ip);
+        normalize_host_ip(c.socks5_bind_ip);
         c.socks5_bind_port = j.get_int("socks5_bind_port", c.socks5_bind_port);
         c.listen_backlog = j.get_int("listen_backlog", c.listen_backlog);
         c.idle_timeout_sec = j.get_int("idle_timeout_sec", c.idle_timeout_sec);
@@ -215,6 +378,7 @@ struct SmartlinkConfig {
     std::string socks5_bind_ip = "127.0.0.1";
     int socks5_bind_port = 11080;
     std::string server_ip = "127.0.0.1";
+    std::vector<std::string> server_ips;
     int server_port = 18888;
     std::string master_secret = "VortexSecureNetwork2026_KeyMix";
     int padding_min = 0;
@@ -224,15 +388,18 @@ struct SmartlinkConfig {
     int max_payload = 32768;
     std::string rules_path = "config/rules.yaml";
     std::string geoip_cn = "config/geo/geoip-cn.txt";
+    std::string geoipv6_cn = "config/geo/geoipv6-cn.txt";
     std::string geosite_cn = "config/geo/geosite-cn.txt";
     bool log_decisions = true;
+
+    const std::vector<std::string>& uplink_hosts() const { return server_ips; }
 
     static SmartlinkConfig load(const std::string& path) {
         JsonConfig j(path);
         SmartlinkConfig c;
         c.socks5_bind_ip = j.get_string("socks5_bind_ip", c.socks5_bind_ip);
+        normalize_host_ip(c.socks5_bind_ip);
         c.socks5_bind_port = j.get_int("socks5_bind_port", c.socks5_bind_port);
-        c.server_ip = j.get_string("server_ip", c.server_ip);
         c.server_port = j.get_int("server_port", c.server_port);
         c.master_secret = j.get_string("master_secret", c.master_secret);
         c.padding_min = j.get_int("padding_min", c.padding_min);
@@ -242,8 +409,19 @@ struct SmartlinkConfig {
         c.max_payload = j.get_int("max_payload", c.max_payload);
         c.rules_path = j.get_string("rules_path", c.rules_path);
         c.geoip_cn = j.get_string("geoip_cn", c.geoip_cn);
+        c.geoipv6_cn = j.get_string("geoipv6_cn", c.geoipv6_cn);
         c.geosite_cn = j.get_string("geosite_cn", c.geosite_cn);
         c.log_decisions = j.get_bool("log_decisions", c.log_decisions);
+        {
+            std::ifstream in(path);
+            if (in) {
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                c.server_ips = parse_server_ip_list(ss.str());
+            }
+            if (c.server_ips.empty()) c.server_ip = j.get_string("server_ip", c.server_ip);
+            finalize_server_ips(c.server_ips, c.server_ip);
+        }
         if (c.padding_min < 0) c.padding_min = 0;
         if (c.padding_max < c.padding_min) c.padding_max = c.padding_min;
         if (c.max_payload < 1024) c.max_payload = 1024;
@@ -255,7 +433,10 @@ struct SmartlinkConfig {
 // One named upstream in multilink.json ("link1", "link2", ...).
 struct LinkEndpoint {
     std::string name;
+    // Preferred / primary address (first of server_ips after IPv6-prefer ordering).
     std::string server_ip = "127.0.0.1";
+    // All uplink addresses from config: string or JSON array. IPv6 tried first.
+    std::vector<std::string> server_ips;
     int server_port = 18888;
     std::string master_secret = "VortexSecureNetwork2026_KeyMix";
     // If set, CONNECT is sent as CMD_VIA_PEER so the server relays through a peer.
@@ -264,6 +445,10 @@ struct LinkEndpoint {
     int padding_max = 128;
     int idle_timeout_sec = 300;
     int max_payload = 32768;
+
+    const std::vector<std::string>& uplink_hosts() const {
+        return server_ips;
+    }
 };
 
 // peer.exe — dials into server, registers with peer_secret, exits traffic for VIA_PEER.
@@ -272,6 +457,7 @@ struct LinkEndpoint {
 //   to_local  ≈ ssh -L : peer binds local_*, server dials remote_*
 struct PeerConfig {
     std::string server_ip = "127.0.0.1";
+    std::vector<std::string> server_ips;
     int server_port = 18888;
     std::string master_secret = "VortexSecureNetwork2026_KeyMix";
     std::string peer_secret = "test_peer_secret";
@@ -293,10 +479,11 @@ struct PeerConfig {
     std::string to_remote_json; // raw object slice (may be empty)
     std::string to_local_json;
 
+    const std::vector<std::string>& uplink_hosts() const { return server_ips; }
+
     static PeerConfig load(const std::string& path) {
         JsonConfig j(path);
         PeerConfig c;
-        c.server_ip = j.get_string("server_ip", c.server_ip);
         c.server_port = j.get_int("server_port", c.server_port);
         c.master_secret = j.get_string("master_secret", c.master_secret);
         c.peer_secret = j.get_string("peer_secret", c.peer_secret);
@@ -304,6 +491,16 @@ struct PeerConfig {
         c.padding_max = j.get_int("padding_max", c.padding_max);
         c.idle_timeout_sec = j.get_int("idle_timeout_sec", c.idle_timeout_sec);
         c.max_payload = j.get_int("max_payload", c.max_payload);
+        {
+            std::ifstream in(path);
+            if (in) {
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                c.server_ips = parse_server_ip_list(ss.str());
+            }
+            if (c.server_ips.empty()) c.server_ip = j.get_string("server_ip", c.server_ip);
+            finalize_server_ips(c.server_ips, c.server_ip);
+        }
         c.workers = j.get_int("workers", c.workers);
         c.reconnect_ms = j.get_int("reconnect_ms", c.reconnect_ms);
         c.enable_udp = j.get_bool("enable_udp", c.enable_udp);
@@ -386,6 +583,7 @@ struct MultilinkConfig {
     std::string default_link; // first declared link name
     std::string rules_path = "config/multirules.yaml";
     std::string geoip_cn = "config/geo/geoip-cn.txt";
+    std::string geoipv6_cn = "config/geo/geoipv6-cn.txt";
     std::string geosite_cn = "config/geo/geosite-cn.txt";
     bool log_decisions = true;
 
@@ -403,6 +601,7 @@ struct MultilinkConfig {
 
 private:
     static void normalize_link(LinkEndpoint& c) {
+        finalize_server_ips(c.server_ips, c.server_ip);
         if (c.padding_min < 0) c.padding_min = 0;
         if (c.padding_max < c.padding_min) c.padding_max = c.padding_min;
         if (c.max_payload < 1024) c.max_payload = 1024;
@@ -437,6 +636,84 @@ private:
             }
         }
         return std::string::npos;
+    }
+
+    static size_t matching_bracket(const std::string& text, size_t open) {
+        int depth = 0;
+        bool in_str = false;
+        for (size_t i = open; i < text.size(); ++i) {
+            const char ch = text[i];
+            if (in_str) {
+                if (ch == '\\' && i + 1 < text.size()) {
+                    ++i;
+                    continue;
+                }
+                if (ch == '"') in_str = false;
+                continue;
+            }
+            if (ch == '"') {
+                in_str = true;
+                continue;
+            }
+            if (ch == '[') ++depth;
+            else if (ch == ']') {
+                --depth;
+                if (depth == 0) return i;
+            }
+        }
+        return std::string::npos;
+    }
+
+    // "server_ip": "1.2.3.4"  or  "server_ip": ["2001:db8::1", "1.2.3.4"]
+    static std::vector<std::string> get_string_list_in(const std::string& text,
+                                                       const std::string& key) {
+        std::vector<std::string> out;
+        const std::string pattern = "\"" + key + "\"";
+        size_t pos = text.find(pattern);
+        if (pos == std::string::npos) return out;
+        pos = text.find(':', pos + pattern.size());
+        if (pos == std::string::npos) return out;
+        ++pos;
+        skip_ws(text, pos);
+        if (pos >= text.size()) return out;
+        if (text[pos] == '"') {
+            ++pos;
+            std::string s;
+            while (pos < text.size() && text[pos] != '"') {
+                if (text[pos] == '\\' && pos + 1 < text.size()) {
+                    s.push_back(text[pos + 1]);
+                    pos += 2;
+                } else {
+                    s.push_back(text[pos++]);
+                }
+            }
+            if (!s.empty()) out.push_back(std::move(s));
+            return out;
+        }
+        if (text[pos] != '[') return out;
+        const size_t end = matching_bracket(text, pos);
+        if (end == std::string::npos) return out;
+        size_t i = pos + 1;
+        while (i < end) {
+            skip_ws(text, i);
+            if (i >= end || text[i] == ']') break;
+            if (text[i] != '"') break;
+            ++i;
+            std::string s;
+            while (i < end && text[i] != '"') {
+                if (text[i] == '\\' && i + 1 < end) {
+                    s.push_back(text[i + 1]);
+                    i += 2;
+                } else {
+                    s.push_back(text[i++]);
+                }
+            }
+            if (i < end && text[i] == '"') ++i;
+            if (!s.empty()) out.push_back(std::move(s));
+            skip_ws(text, i);
+            if (i < end && text[i] == ',') ++i;
+        }
+        return out;
     }
 
     static std::string object_slice(const std::string& text, const std::string& key) {
@@ -507,7 +784,10 @@ private:
     static LinkEndpoint parse_link(const std::string& name, const std::string& body) {
         LinkEndpoint e;
         e.name = name;
-        e.server_ip = get_string_in(body, "server_ip", e.server_ip);
+        e.server_ips = get_string_list_in(body, "server_ip");
+        if (e.server_ips.empty()) {
+            e.server_ip = get_string_in(body, "server_ip", e.server_ip);
+        }
         e.server_port = get_int_in(body, "server_port", e.server_port);
         e.master_secret = get_string_in(body, "master_secret", e.master_secret);
         e.peer_secret = get_string_in(body, "peer_secret", e.peer_secret);
@@ -564,10 +844,12 @@ inline MultilinkConfig MultilinkConfig::load(const std::string& path) {
 
     MultilinkConfig c;
     c.socks5_bind_ip = get_string_in(text, "socks5_bind_ip", c.socks5_bind_ip);
+    normalize_host_ip(c.socks5_bind_ip);
     c.socks5_bind_port = get_int_in(text, "socks5_bind_port", c.socks5_bind_port);
     c.listen_backlog = get_int_in(text, "listen_backlog", c.listen_backlog);
     c.rules_path = get_string_in(text, "rules_path", c.rules_path);
     c.geoip_cn = get_string_in(text, "geoip_cn", c.geoip_cn);
+    c.geoipv6_cn = get_string_in(text, "geoipv6_cn", c.geoipv6_cn);
     c.geosite_cn = get_string_in(text, "geosite_cn", c.geosite_cn);
     c.log_decisions = get_bool_in(text, "log_decisions", c.log_decisions);
 

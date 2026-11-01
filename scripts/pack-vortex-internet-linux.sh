@@ -22,6 +22,7 @@ install -m 755 "$ROOT/linux_network" "$OUT/linux_network"
 install -m 644 "$ROOT/config/internet.json" "$OUT/config/internet.json"
 install -m 644 "$ROOT/config/multirules.yaml" "$OUT/config/multirules.yaml"
 install -m 644 "$ROOT/config/geo/geoip-cn.txt" "$OUT/config/geo/geoip-cn.txt"
+install -m 644 "$ROOT/config/geo/geoipv6-cn.txt" "$OUT/config/geo/geoipv6-cn.txt"
 install -m 644 "$ROOT/config/geo/geosite-cn.txt" "$OUT/config/geo/geosite-cn.txt"
 
 # Network restore helpers (same content as repo scripts/; live at package root)
@@ -104,6 +105,7 @@ need=(
   "$ROOT/config/internet.json"
   "$ROOT/config/multirules.yaml"
   "$ROOT/config/geo/geoip-cn.txt"
+  "$ROOT/config/geo/geoipv6-cn.txt"
   "$ROOT/config/geo/geosite-cn.txt"
   "$ROOT/vortex-linux-network.service"
   "$ROOT/restore-network-settings.sh"

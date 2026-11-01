@@ -7,6 +7,7 @@
 // TCP and UDP both supported. One TCP registration handles many sequential jobs.
 
 #include "config.hpp"
+#include "icmp_util.hpp"
 #include "net.hpp"
 #include "port_forward.hpp"
 #include "protocol.hpp"
@@ -36,6 +37,9 @@ using nfds_count_t = ULONG;
 inline int vortex_poll(pollfd_t* fds, nfds_count_t nfds, int timeout_ms) {
     return WSAPoll(fds, nfds, timeout_ms);
 }
+#ifndef POLLNVAL
+#  define POLLNVAL 0x0020
+#endif
 #else
 using pollfd_t = pollfd;
 using nfds_count_t = nfds_t;
@@ -43,6 +47,14 @@ inline int vortex_poll(pollfd_t* fds, nfds_count_t nfds, int timeout_ms) {
     return ::poll(fds, nfds, timeout_ms);
 }
 #endif
+
+// See server.cpp: POLLNVAL / sticky POLLERR must not be ignored in poll loops.
+inline bool poll_revents_invalid(short revents) {
+    return (revents & POLLNVAL) != 0;
+}
+inline bool poll_revents_err_or_hup(short revents) {
+    return (revents & (POLLERR | POLLHUP)) != 0;
+}
 
 std::atomic<bool> g_running{true};
 std::atomic<int> g_fwd_conns{0};
@@ -106,6 +118,38 @@ void relay_target_to_server(std::shared_ptr<PeerSession> s, std::shared_ptr<JobS
     if (job->target_fd != INVALID_SOCK) {
         shutdown_both(job->target_fd);
     }
+}
+
+// Single-shot ICMP echo exit (server sent CMD_ICMP as a peer job).
+bool handle_one_icmp_job(std::shared_ptr<PeerSession> s, const std::vector<uint8_t>& icmp_wire) {
+    std::string host;
+    std::vector<uint8_t> req;
+    if (!vortex::parse_icmp_wire(icmp_wire, host, req)) {
+        vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_CONNECT_FAIL, nullptr, 0,
+                           s->cfg.padding_min, s->cfg.padding_max);
+        return true;
+    }
+    std::vector<uint8_t> reply;
+    if (!vortex::icmp_util::echo_exchange(host, req, reply, 3000) || reply.empty()) {
+        vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_CONNECT_FAIL, nullptr, 0,
+                           s->cfg.padding_min, s->cfg.padding_max);
+        std::cout << "[-] Peer ICMP fail " << host << std::endl;
+        std::cout.flush();
+        return true;
+    }
+    if (!vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_DATA, reply,
+                            s->cfg.padding_min, s->cfg.padding_max)) {
+        return false;
+    }
+    if (!vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_CLOSE, nullptr, 0,
+                            s->cfg.padding_min, s->cfg.padding_max)) {
+        return false;
+    }
+    const char* kind = vortex::icmp_util::is_echo_request_v6(req.data(), req.size()) ? "ICMPv6"
+                                                                                      : "ICMP";
+    std::cout << "[+] Peer " << kind << " " << host << std::endl;
+    std::cout.flush();
+    return true;
 }
 
 bool handle_one_job(std::shared_ptr<PeerSession> s, const std::vector<uint8_t>& connect_data) {
@@ -235,10 +279,10 @@ bool send_fwd_config(socket_t fd, vortex::SessionCrypto& crypto, const PeerConfi
 }
 
 bool run_peer_session(const PeerConfig& cfg, const LoadedForwards& fwd) {
-    socket_t fd = tcp_connect(cfg.server_ip, cfg.server_port, cfg.idle_timeout_sec);
+    socket_t fd = tcp_connect_hosts(cfg.uplink_hosts(), cfg.server_port, cfg.idle_timeout_sec);
     if (fd == INVALID_SOCK) {
-        std::cerr << "[-] Peer cannot reach server " << cfg.server_ip << ":" << cfg.server_port
-                  << "\n";
+        std::cerr << "[-] Peer cannot reach server "
+                  << format_hosts_port(cfg.uplink_hosts(), cfg.server_port) << "\n";
         return false;
     }
     set_socket_options(fd, cfg.idle_timeout_sec);
@@ -285,12 +329,15 @@ bool run_peer_session(const PeerConfig& cfg, const LoadedForwards& fwd) {
         auto job = vortex::recv_frame(fd, s->from_server, cfg.max_payload);
         set_recv_timeout(fd, cfg.idle_timeout_sec);
         if (!job.ok) return false;
-        if (job.cmd != vortex::CMD_CONNECT) {
-            std::cerr << "[-] Peer expected CONNECT job, got cmd=" << static_cast<int>(job.cmd)
-                      << "\n";
+        if (job.cmd == vortex::CMD_CONNECT) {
+            if (!handle_one_job(s, job.data)) return false;
+        } else if (job.cmd == vortex::CMD_ICMP) {
+            if (!handle_one_icmp_job(s, job.data)) return false;
+        } else {
+            std::cerr << "[-] Peer expected CONNECT/ICMP job, got cmd="
+                      << static_cast<int>(job.cmd) << "\n";
             return false;
         }
-        if (!handle_one_job(s, job.data)) return false;
     }
     return true;
 }
@@ -361,7 +408,7 @@ void handle_to_local_tcp_client(socket_t local_fd, PeerConfig cfg, std::string t
     set_socket_options(local_fd, s->cfg.idle_timeout_sec);
 
     socket_t remote_fd =
-        tcp_connect(s->cfg.server_ip, s->cfg.server_port, s->cfg.idle_timeout_sec);
+        tcp_connect_hosts(s->cfg.uplink_hosts(), s->cfg.server_port, s->cfg.idle_timeout_sec);
     if (remote_fd == INVALID_SOCK) return;
     s->remote_fd = remote_fd;
     set_socket_options(remote_fd, s->cfg.idle_timeout_sec);
@@ -437,16 +484,19 @@ void to_local_tcp_accept_loop(socket_t listen_fd, PeerConfig cfg, std::string ta
             break;
         }
         if (sel == 0) continue;
-        sockaddr_in peer{};
-        socklen_type plen = sizeof(peer);
+        if (poll_revents_invalid(pfd.revents) || poll_revents_err_or_hup(pfd.revents)) break;
+        if (!(pfd.revents & POLLIN)) continue;
         // Back-pressure: do not accept when at cap (avoids accept-then-RST which
         // looks like a successful connect followed by a mysterious short read).
         if (g_fwd_conns.load() >= cfg.forward_max_conns) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
-        socket_t c = accept(listen_fd, reinterpret_cast<sockaddr*>(&peer), &plen);
-        if (c == INVALID_SOCK) continue;
+        socket_t c = accept_any(listen_fd);
+        if (c == INVALID_SOCK) {
+            if (!net_would_block(net_errno())) break;
+            continue;
+        }
         if (g_fwd_conns.load() >= cfg.forward_max_conns) {
             net_close(c);
             continue;
@@ -512,7 +562,7 @@ void expire_udp_local(std::shared_ptr<UdpMuxState> st) {
 }
 
 bool run_udp_mux_session(PeerConfig cfg, LoadedForwards fwd, std::shared_ptr<UdpMuxState> st) {
-    socket_t fd = tcp_connect(cfg.server_ip, cfg.server_port, cfg.idle_timeout_sec);
+    socket_t fd = tcp_connect_hosts(cfg.uplink_hosts(), cfg.server_port, cfg.idle_timeout_sec);
     if (fd == INVALID_SOCK) return false;
     set_socket_options(fd, cfg.idle_timeout_sec);
     set_tcp_keepalive(fd, 60, 10, 3);
@@ -658,7 +708,18 @@ bool run_udp_mux_session(PeerConfig cfg, LoadedForwards fwd, std::shared_ptr<Udp
         const size_t listen_base = 1;
         const size_t remote_base = listen_base + listens.size();
         for (size_t i = 0; i < listens.size(); ++i) {
-            if (!(pfds[listen_base + i].revents & (POLLIN | POLLERR | POLLHUP))) continue;
+            const short rev = pfds[listen_base + i].revents;
+            if (poll_revents_invalid(rev)) {
+                // Drop invalid listen fd from the shared map so poll cannot spin.
+                std::lock_guard<std::mutex> lock(st->mu);
+                auto it = st->listen_fds.find(listens[i].first);
+                if (it != st->listen_fds.end()) {
+                    if (it->second != INVALID_SOCK) net_close(it->second);
+                    st->listen_fds.erase(it);
+                }
+                continue;
+            }
+            if (!(rev & (POLLIN | POLLERR | POLLHUP))) continue;
             auto& kv = listens[i];
             sockaddr_in from{};
             const int n = udp_recv_from(kv.second, buf.data(), buf.size(), from);
@@ -701,11 +762,19 @@ bool run_udp_mux_session(PeerConfig cfg, LoadedForwards fwd, std::shared_ptr<Udp
         if (!st->alive) break;
 
         for (size_t i = 0; i < remote_socks.size(); ++i) {
-            if (!(pfds[remote_base + i].revents & (POLLIN | POLLERR | POLLHUP))) continue;
+            const short rev = pfds[remote_base + i].revents;
+            if (poll_revents_invalid(rev)) {
+                close_remote_sid(remote_socks[i].first);
+                continue;
+            }
+            if (!(rev & (POLLIN | POLLERR | POLLHUP))) continue;
             auto& kv = remote_socks[i];
             sockaddr_in from{};
             const int n = udp_recv_from(kv.second, buf.data(), buf.size(), from);
-            if (n <= 0) continue;
+            if (n <= 0) {
+                if (poll_revents_err_or_hup(rev)) close_remote_sid(kv.first);
+                continue;
+            }
             remote_sid_last[kv.first] = now;
             auto pl = vortex::build_udp_data_payload(kv.first, nullptr, 0, buf.data(),
                                                      static_cast<size_t>(n), 0);
@@ -717,6 +786,10 @@ bool run_udp_mux_session(PeerConfig cfg, LoadedForwards fwd, std::shared_ptr<Udp
             }
         }
         if (!st->alive) break;
+        if (poll_revents_invalid(pfds[0].revents)) {
+            st->alive = false;
+            break;
+        }
         if (!(pfds[0].revents & (POLLIN | POLLERR | POLLHUP))) continue;
 
         // Drain queued mux frames; a single recv_frame per poll starves UDP under load.
@@ -800,6 +873,10 @@ bool run_udp_mux_session(PeerConfig cfg, LoadedForwards fwd, std::shared_ptr<Udp
             more.fd = fd;
             more.events = POLLIN;
             if (vortex_poll(&more, 1, 0) <= 0) break;
+            if (poll_revents_invalid(more.revents)) {
+                st->alive = false;
+                break;
+            }
             if (!(more.revents & (POLLIN | POLLERR | POLLHUP))) break;
         }
     }
@@ -855,7 +932,8 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    std::cout << "[*] Vortex Peer → " << cfg.server_ip << ":" << cfg.server_port
+    std::cout << "[*] Vortex Peer → "
+              << format_hosts_port(cfg.uplink_hosts(), cfg.server_port)
               << "  workers=" << cfg.workers
               << "  padding=[" << cfg.padding_min << "," << cfg.padding_max << "]"
               << "  multi-job=on" << std::endl;

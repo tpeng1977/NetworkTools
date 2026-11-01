@@ -1,0 +1,3 @@
+rules:
+  # Force everything through Vortex uplink (exercises PROXY + IPv6 CONNECT wire).
+  - MATCH,PROXY

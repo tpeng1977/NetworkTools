@@ -1,0 +1,12 @@
+{
+  "socks5_bind_ip": "::",
+  "socks5_bind_port": 21080,
+  "server_ip": ["::1", "127.0.0.1"],
+  "server_port": 28888,
+  "master_secret": "VortexDualStackTestSecret2026",
+  "padding_min": 4,
+  "padding_max": 24,
+  "listen_backlog": 512,
+  "idle_timeout_sec": 120,
+  "max_payload": 32768
+}

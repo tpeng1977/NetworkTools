@@ -29,10 +29,87 @@ constexpr uint8_t CMD_VIA_PEER     = 0x07; // client→server: [u8 len][secret][
 constexpr uint8_t CMD_FWD_CONFIG   = 0x08; // peer→server after HELLO: PortForward maps
 constexpr uint8_t CMD_UDP_DATA     = 0x09; // UDP datagram on mux: [sid][addr?][payload]
 constexpr uint8_t CMD_UDP_CLOSE    = 0x0A; // UDP session expiry: [sid][flags]
+// ICMP echo relay (ping diagnostics over Vortex). Payload carries address + ICMP body.
+constexpr uint8_t CMD_ICMP           = 0x0B; // client↔server / server↔peer
+constexpr uint8_t CMD_VIA_PEER_ICMP  = 0x0C; // client→server: [u8 len][secret][ICMP wire]
 
 constexpr uint8_t ATYP_IPV4   = 0x01;
 constexpr uint8_t ATYP_DOMAIN = 0x03;
 constexpr uint8_t ATYP_IPV6   = 0x04;
+
+// ICMP wire (CMD_ICMP data / inner of VIA_PEER_ICMP):
+//   [u8 ver=1][atyp][addr…][icmp_payload…]
+// No port field (unlike CONNECT). icmp_payload is type/code/checksum/rest:
+//   IPv4 ICMP echo = type 8/0; ICMPv6 echo = type 128/129 (ATYP_IPV6).
+// Exit side recomputes checksum (ICMPv6 via kernel pseudo-header when csum=0).
+inline std::vector<uint8_t> build_icmp_wire(const std::string& host,
+                                            const uint8_t* icmp, size_t icmp_len) {
+    std::vector<uint8_t> out;
+    if (!icmp || icmp_len < 8 || icmp_len > 65535 - 32) return out;
+    in_addr v4{};
+    in6_addr v6{};
+    out.push_back(1); // version
+    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) {
+        out.push_back(ATYP_IPV4);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v4);
+        out.insert(out.end(), p, p + 4);
+    } else if (inet_pton(AF_INET6, host.c_str(), &v6) == 1) {
+        out.push_back(ATYP_IPV6);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v6);
+        out.insert(out.end(), p, p + 16);
+    } else {
+        return {};
+    }
+    out.insert(out.end(), icmp, icmp + icmp_len);
+    return out;
+}
+
+inline bool parse_icmp_wire(const std::vector<uint8_t>& data, std::string& host,
+                            std::vector<uint8_t>& icmp) {
+    host.clear();
+    icmp.clear();
+    if (data.size() < 1 + 1 + 4 + 8 || data[0] != 1) return false;
+    size_t off = 1;
+    const uint8_t atyp = data[off++];
+    if (atyp == ATYP_IPV4) {
+        if (data.size() < off + 4 + 8) return false;
+        char ip[INET_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET, data.data() + off, ip, sizeof(ip))) return false;
+        host = ip;
+        off += 4;
+    } else if (atyp == ATYP_IPV6) {
+        if (data.size() < off + 16 + 8) return false;
+        char ip[INET6_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET6, data.data() + off, ip, sizeof(ip))) return false;
+        host = ip;
+        off += 16;
+    } else {
+        return false;
+    }
+    icmp.assign(data.begin() + static_cast<std::ptrdiff_t>(off), data.end());
+    return !host.empty() && icmp.size() >= 8;
+}
+
+inline std::vector<uint8_t> build_via_peer_icmp_payload(const std::string& peer_secret,
+                                                        const std::vector<uint8_t>& icmp_wire) {
+    std::vector<uint8_t> out;
+    if (peer_secret.empty() || peer_secret.size() > 255 || icmp_wire.empty()) return out;
+    out.push_back(static_cast<uint8_t>(peer_secret.size()));
+    out.insert(out.end(), peer_secret.begin(), peer_secret.end());
+    out.insert(out.end(), icmp_wire.begin(), icmp_wire.end());
+    return out;
+}
+
+inline bool parse_via_peer_icmp_payload(const std::vector<uint8_t>& data,
+                                        std::string& peer_secret,
+                                        std::vector<uint8_t>& icmp_wire) {
+    if (data.empty()) return false;
+    const size_t n = data[0];
+    if (n == 0 || data.size() < 1 + n + 1 + 1 + 4 + 8) return false;
+    peer_secret.assign(reinterpret_cast<const char*>(data.data() + 1), n);
+    icmp_wire.assign(data.begin() + 1 + static_cast<std::ptrdiff_t>(n), data.end());
+    return !peer_secret.empty() && !icmp_wire.empty();
+}
 
 inline std::vector<uint8_t> build_via_peer_payload(const std::string& peer_secret,
                                                    const std::vector<uint8_t>& target_wire) {

@@ -1,0 +1,12 @@
+{
+  "bind_ip": "::",
+  "bind_port": 28888,
+  "master_secret": "VortexDualStackTestSecret2026",
+  "padding_min": 4,
+  "padding_max": 24,
+  "camouflage": false,
+  "listen_backlog": 512,
+  "idle_timeout_sec": 120,
+  "max_payload": 32768,
+  "max_connections": 4096
+}

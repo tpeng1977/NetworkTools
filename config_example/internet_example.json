@@ -34,6 +34,7 @@
   "listen_backlog": 128,
   "rules_path": "config/multirules.yaml",
   "geoip_cn": "config/geo/geoip-cn.txt",
+  "geoipv6_cn": "config/geo/geoipv6-cn.txt",
   "geosite_cn": "config/geo/geosite-cn.txt",
   "log_decisions": true
 }

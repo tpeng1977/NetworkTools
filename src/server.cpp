@@ -1,4 +1,5 @@
 #include "config.hpp"
+#include "icmp_util.hpp"
 #include "net.hpp"
 #include "port_forward.hpp"
 #include "protocol.hpp"
@@ -29,6 +30,9 @@ using nfds_count_t = ULONG;
 inline int vortex_poll(pollfd_t* fds, nfds_count_t nfds, int timeout_ms) {
     return WSAPoll(fds, nfds, timeout_ms);
 }
+#ifndef POLLNVAL
+#  define POLLNVAL 0x0020
+#endif
 #else
 using pollfd_t = pollfd;
 using nfds_count_t = nfds_t;
@@ -36,6 +40,17 @@ inline int vortex_poll(pollfd_t* fds, nfds_count_t nfds, int timeout_ms) {
     return ::poll(fds, nfds, timeout_ms);
 }
 #endif
+
+// Closed/invalid fds report POLLNVAL; sticky POLLERR makes poll return
+// immediately with timeout ignored. Detached listener/mux threads must treat
+// these as fatal (or drop the fd) — otherwise they busy-spin at ~100% CPU
+// after stop_fwd_install / peer teardown.
+inline bool poll_revents_invalid(short revents) {
+    return (revents & POLLNVAL) != 0;
+}
+inline bool poll_revents_err_or_hup(short revents) {
+    return (revents & (POLLERR | POLLHUP)) != 0;
+}
 
 std::atomic<bool> g_running{true};
 std::atomic<int> g_active_sessions{0};
@@ -463,16 +478,21 @@ void to_remote_tcp_accept_loop(socket_t listen_fd, FwdBinding bind, ServerConfig
             break;
         }
         if (sel == 0) continue;
-        sockaddr_in peeraddr{};
-        socklen_type plen = sizeof(peeraddr);
+        // stop_fwd_install closes this fd under us — exit instead of spinning.
+        if (poll_revents_invalid(pfd.revents) || poll_revents_err_or_hup(pfd.revents)) break;
+        if (!(pfd.revents & POLLIN)) continue;
         // Back-pressure: skip accept when at cap so clients block/fail on connect
         // instead of seeing accept-then-RST mid-handshake.
         if (g_fwd_conns.load() >= max_fwd) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
-        socket_t c = accept(listen_fd, reinterpret_cast<sockaddr*>(&peeraddr), &plen);
-        if (c == INVALID_SOCK) continue;
+        socket_t c = accept_any(listen_fd);
+        if (c == INVALID_SOCK) {
+            // Listen socket gone / hard error — do not busy-continue.
+            if (!net_would_block(net_errno())) break;
+            continue;
+        }
         if (g_fwd_conns.load() >= max_fwd) {
             net_close(c);
             continue;
@@ -558,11 +578,17 @@ void to_remote_udp_loop(socket_t listen_fd, FwdBinding bind, ServerConfig cfg,
             last_expire = now;
         }
         if (sel == 0) continue;
+        // Closed by stop_fwd_install — exit; do not ignore POLLNVAL (busy-spin).
+        if (poll_revents_invalid(pfd.revents)) break;
         if (!(pfd.revents & (POLLIN | POLLERR | POLLHUP))) continue;
 
         sockaddr_in from{};
         const int n = udp_recv_from(listen_fd, buf.data(), buf.size(), from);
-        if (n <= 0) continue;
+        if (n <= 0) {
+            // Sticky POLLERR/HUP that recv did not clear → exit (avoid poll busy-spin).
+            if (poll_revents_err_or_hup(pfd.revents) && !net_would_block(net_errno())) break;
+            continue;
+        }
 
         auto mux = acquire_udp_mux(bind.secret);
         if (!mux) continue;
@@ -695,11 +721,20 @@ void run_udp_mux_server_loop_v2(std::shared_ptr<PeerConn> peer) {
 
         if (sel > 0) {
             for (size_t i = 0; i < local_socks.size(); ++i) {
-                if (!(pfds[1 + i].revents & (POLLIN | POLLERR | POLLHUP))) continue;
+                const short rev = pfds[1 + i].revents;
+                if (poll_revents_invalid(rev)) {
+                    close_local_sid(local_socks[i].first);
+                    continue;
+                }
+                if (!(rev & (POLLIN | POLLERR | POLLHUP))) continue;
                 auto& kv = local_socks[i];
                 sockaddr_in from{};
                 const int n = udp_recv_from(kv.second, buf.data(), buf.size(), from);
-                if (n <= 0) continue;
+                if (n <= 0) {
+                    // Drop sid on sticky error so poll cannot wake forever.
+                    if (poll_revents_err_or_hup(rev)) close_local_sid(kv.first);
+                    continue;
+                }
                 local_sid_last[kv.first] = now;
                 auto pl = vortex::build_udp_data_payload(
                     kv.first, nullptr, 0, buf.data(), static_cast<size_t>(n),
@@ -714,7 +749,12 @@ void run_udp_mux_server_loop_v2(std::shared_ptr<PeerConn> peer) {
             }
         }
         if (!peer->alive) break;
-        if (sel == 0 || !(pfds[0].revents & (POLLIN | POLLERR | POLLHUP))) continue;
+        if (sel == 0) continue;
+        if (poll_revents_invalid(pfds[0].revents)) {
+            peer->alive = false;
+            break;
+        }
+        if (!(pfds[0].revents & (POLLIN | POLLERR | POLLHUP))) continue;
 
         for (int drained = 0; peer->alive && drained < 128; ++drained) {
             auto frame = vortex::recv_frame(peer->fd, peer->up, peer->cfg.max_payload);
@@ -822,6 +862,10 @@ void run_udp_mux_server_loop_v2(std::shared_ptr<PeerConn> peer) {
             more.fd = peer->fd;
             more.events = POLLIN;
             if (vortex_poll(&more, 1, 0) <= 0) break;
+            if (poll_revents_invalid(more.revents)) {
+                peer->alive = false;
+                break;
+            }
             if (!(more.revents & (POLLIN | POLLERR | POLLHUP))) break;
         }
     }
@@ -961,9 +1005,130 @@ bool handle_connect_direct(std::shared_ptr<ServerSession>& s,
         return false;
     }
 
-    std::cout << "[+] Connected " << host << ":" << port << std::endl;
-    std::cout.flush();
+    // Avoid per-connection console I/O under soak / browser bursts (was multi-100MB logs).
+    static std::atomic<uint64_t> connect_ok{0};
+    const uint64_t n = ++connect_ok;
+    if (n <= 8 || (n % 1000) == 0) {
+        std::cout << "[+] Connected " << format_host_port(host, port) << "  (#" << n << ")"
+                  << std::endl;
+        std::cout.flush();
+    }
     std::thread(relay_target_to_client, s).detach();
+    return true;
+}
+
+// Single-shot ICMP echo via this server's raw socket exit.
+bool handle_icmp_direct(std::shared_ptr<ServerSession>& s, const std::vector<uint8_t>& data) {
+    std::string host;
+    std::vector<uint8_t> req;
+    if (!vortex::parse_icmp_wire(data, host, req)) {
+        vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL, nullptr, 0,
+                           s->cfg.padding_min, s->cfg.padding_max);
+        return false;
+    }
+    std::vector<uint8_t> reply;
+    const int timeout_ms = 3000;
+    if (!vortex::icmp_util::echo_exchange(host, req, reply, timeout_ms) || reply.empty()) {
+        std::cout << "[-] ICMP fail " << host << std::endl;
+        std::cout.flush();
+        vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL, nullptr, 0,
+                           s->cfg.padding_min, s->cfg.padding_max);
+        return false;
+    }
+    if (!vortex::send_frame(s->client_fd, s->down, vortex::CMD_DATA, reply, s->cfg.padding_min,
+                            s->cfg.padding_max)) {
+        return false;
+    }
+    vortex::send_frame(s->client_fd, s->down, vortex::CMD_CLOSE, nullptr, 0, s->cfg.padding_min,
+                       s->cfg.padding_max);
+    const char* kind = vortex::icmp_util::is_echo_request_v6(req.data(), req.size()) ? "ICMPv6"
+                                                                                      : "ICMP";
+    std::cout << "[+] " << kind << " " << host << " id=" << vortex::icmp_util::echo_id(req.data())
+              << " seq=" << vortex::icmp_util::echo_seq(req.data()) << std::endl;
+    std::cout.flush();
+    return true;
+}
+
+bool open_peer_icmp_job(std::shared_ptr<PeerConn>& peer, const std::string& secret,
+                        const std::vector<uint8_t>& icmp_wire, const ServerConfig& cfg,
+                        std::vector<uint8_t>& reply_out) {
+    reply_out.clear();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(15000);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+        peer = acquire_peer(secret, left > 0 ? static_cast<int>(left) : 0);
+        if (!peer) return false;
+
+        set_recv_timeout(peer->fd, 5);
+        if (!vortex::send_frame(peer->fd, peer->down, vortex::CMD_ICMP, icmp_wire,
+                                cfg.padding_min, cfg.padding_max)) {
+            release_peer(peer, true);
+            peer.reset();
+            continue;
+        }
+        set_recv_timeout(peer->fd, kPeerJobIoSec);
+        auto reply = vortex::recv_frame(peer->fd, peer->up, cfg.max_payload);
+        if (!reply.ok) {
+            release_peer(peer, true);
+            peer.reset();
+            continue;
+        }
+        if (reply.cmd == vortex::CMD_DATA && !reply.data.empty()) {
+            reply_out = std::move(reply.data);
+            // Expect peer job-end CLOSE so the worker can return to the pool.
+            auto fin = vortex::recv_frame(peer->fd, peer->up, cfg.max_payload);
+            const bool got_close = fin.ok && fin.cmd == vortex::CMD_CLOSE;
+            finish_peer_job(peer, cfg, true, got_close);
+            peer.reset();
+            return true;
+        }
+        if (reply.cmd == vortex::CMD_CONNECT_FAIL) {
+            release_peer(peer, false);
+            peer.reset();
+            return false;
+        }
+        release_peer(peer, true);
+        peer.reset();
+        return false;
+    }
+    return false;
+}
+
+bool handle_via_peer_icmp(std::shared_ptr<ServerSession>& s, const std::vector<uint8_t>& data) {
+    std::string secret;
+    std::vector<uint8_t> icmp_wire;
+    if (!vortex::parse_via_peer_icmp_payload(data, secret, icmp_wire)) {
+        vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL, nullptr, 0,
+                           s->cfg.padding_min, s->cfg.padding_max);
+        return false;
+    }
+    std::string host;
+    std::vector<uint8_t> req;
+    if (!vortex::parse_icmp_wire(icmp_wire, host, req)) {
+        vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL, nullptr, 0,
+                           s->cfg.padding_min, s->cfg.padding_max);
+        return false;
+    }
+    std::shared_ptr<PeerConn> peer;
+    std::vector<uint8_t> reply;
+    if (!open_peer_icmp_job(peer, secret, icmp_wire, s->cfg, reply) || reply.empty()) {
+        std::cout << "[-] Via-peer ICMP no peer/fail " << host << "\n";
+        std::cout.flush();
+        vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL, nullptr, 0,
+                           s->cfg.padding_min, s->cfg.padding_max);
+        return false;
+    }
+    if (!vortex::send_frame(s->client_fd, s->down, vortex::CMD_DATA, reply, s->cfg.padding_min,
+                            s->cfg.padding_max)) {
+        return false;
+    }
+    vortex::send_frame(s->client_fd, s->down, vortex::CMD_CLOSE, nullptr, 0, s->cfg.padding_min,
+                       s->cfg.padding_max);
+    std::cout << "[+] Via-peer ICMP " << host << std::endl;
+    std::cout.flush();
     return true;
 }
 
@@ -1120,6 +1285,13 @@ void handle_peer_hello(socket_t fd, ServerConfig cfg, uint64_t salt,
             break;
         }
         if (sel == 0) continue;
+        if (poll_revents_invalid(pfd.revents) || poll_revents_err_or_hup(pfd.revents)) {
+            // Confirm readability/EOF; POLLNVAL/ERR alone means the link is gone.
+            if (!(pfd.revents & POLLIN) || poll_revents_invalid(pfd.revents)) {
+                peer->alive = false;
+                break;
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(peer->mu);
             if (peer->busy) continue;
@@ -1134,7 +1306,10 @@ void handle_peer_hello(socket_t fd, ServerConfig cfg, uint64_t salt,
             peer->alive = false;
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        // Unexpected bytes while idle (MSG_PEEK does not consume) — desynced stream.
+        // Drop the peer instead of sleeping in a wake/peek loop forever.
+        peer->alive = false;
+        break;
     }
     unregister_peer(peer);
     release_to_remote(secret);
@@ -1274,6 +1449,22 @@ void handle_client(socket_t client_fd, ServerConfig cfg) {
         return;
     }
 
+    if (first.cmd == vortex::CMD_ICMP) {
+        const int to = s->cfg.idle_timeout_sec > 0 ? s->cfg.idle_timeout_sec : 10;
+        set_recv_timeout(client_fd, (std::min)(10, to));
+        handle_icmp_direct(s, first.data);
+        shutdown_both(client_fd);
+        return;
+    }
+
+    if (first.cmd == vortex::CMD_VIA_PEER_ICMP) {
+        const int to = s->cfg.idle_timeout_sec > 0 ? s->cfg.idle_timeout_sec : 15;
+        set_recv_timeout(client_fd, (std::min)(15, to));
+        handle_via_peer_icmp(s, first.data);
+        shutdown_both(client_fd);
+        return;
+    }
+
     fail_probe();
 }
 
@@ -1303,37 +1494,77 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    socket_t listen_fd = create_listen_socket(cfg.bind_ip, cfg.bind_port, cfg.listen_backlog);
-    if (listen_fd == INVALID_SOCK) {
-        std::cerr << "[-] Failed to bind " << cfg.bind_ip << ":" << cfg.bind_port << "\n";
-        net_cleanup();
-        return 1;
+    const auto& hosts = cfg.listen_hosts();
+    // Lone wildcard "::"/"*" → dual-stack. Multi-bind with a v4 companion →
+    // wildcard uses IPV6_V6ONLY=1 so both sockets can coexist on the same port.
+    bool has_v4_companion = false;
+    for (const auto& h : hosts) {
+        if (h == "0.0.0.0" || host_is_ipv4_literal(h)) {
+            has_v4_companion = true;
+            break;
+        }
     }
+    const bool multi = hosts.size() > 1;
 
-    std::cout << "[*] Vortex Shield Server listening on " << cfg.bind_ip << ":" << cfg.bind_port
-              << std::endl;
+    std::vector<socket_t> listen_fds;
+    listen_fds.reserve(hosts.size());
+    for (const auto& bip : hosts) {
+        const bool is_wild = bip.empty() || bip == "*" || bip == "::";
+        const bool prefer_dual = is_wild && !(multi && has_v4_companion);
+        socket_t fd = create_listen_socket(bip, cfg.bind_port, cfg.listen_backlog, prefer_dual);
+        if (fd == INVALID_SOCK) {
+            std::cerr << "[-] Failed to bind " << format_host_port(bip, cfg.bind_port) << "\n";
+            for (socket_t x : listen_fds) net_close(x);
+            net_cleanup();
+            return 1;
+        }
+        listen_fds.push_back(fd);
+        std::cout << "[*] Vortex Shield Server listening on "
+                  << format_host_port(bip, cfg.bind_port);
+        if (prefer_dual) std::cout << " (dual-stack IPv4+IPv6)";
+        else if (bip == "0.0.0.0") std::cout << " (IPv4-only)";
+        else if (is_wild && !prefer_dual) std::cout << " (IPv6-only; companion IPv4 bind)";
+        std::cout << std::endl;
+    }
     std::cout << "[*] Camouflage: " << (cfg.camouflage ? "on" : "off")
               << "  padding=[" << cfg.padding_min << "," << cfg.padding_max << "]"
               << "  peer-relay=on  port-forward=on" << std::endl;
     std::cout.flush();
 
+    std::vector<pollfd_t> pfds(listen_fds.size());
+    for (size_t i = 0; i < listen_fds.size(); ++i) {
+        pfds[i].fd = listen_fds[i];
+        pfds[i].events = POLLIN;
+        pfds[i].revents = 0;
+    }
+
     while (g_running) {
-        sockaddr_in peer{};
-        socklen_type peer_len = sizeof(peer);
-        socket_t client_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len);
-        if (client_fd == INVALID_SOCK) {
+        for (auto& p : pfds) p.revents = 0;
+        const int sel =
+            vortex_poll(pfds.data(), static_cast<nfds_count_t>(pfds.size()), 200);
+        if (sel < 0) {
             if (!g_running) break;
             continue;
         }
-        if (g_active_sessions.load() >= cfg.max_connections) {
-            if (cfg.camouflage) vortex::send_http_camouflage(client_fd);
-            net_close(client_fd);
-            continue;
+        if (sel == 0) continue;
+        for (size_t i = 0; i < pfds.size(); ++i) {
+            if (poll_revents_invalid(pfds[i].revents)) {
+                g_running = false;
+                break;
+            }
+            if ((pfds[i].revents & POLLIN) == 0) continue;
+            socket_t client_fd = accept_any(listen_fds[i]);
+            if (client_fd == INVALID_SOCK) continue;
+            if (g_active_sessions.load() >= cfg.max_connections) {
+                if (cfg.camouflage) vortex::send_http_camouflage(client_fd);
+                net_close(client_fd);
+                continue;
+            }
+            std::thread(handle_client, client_fd, cfg).detach();
         }
-        std::thread(handle_client, client_fd, cfg).detach();
     }
 
-    net_close(listen_fd);
+    for (socket_t fd : listen_fds) net_close(fd);
     net_cleanup();
     std::cout << "[*] Server stopped\n";
     return 0;
