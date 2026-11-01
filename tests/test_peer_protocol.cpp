@@ -72,6 +72,14 @@ int main() {
         const auto via6 = vortex::build_via_peer_icmp_payload(secret, wire6);
         expect(vortex::parse_via_peer_icmp_payload(via6, sec2, wire2) && wire2 == wire6,
                "via icmp6 round-trip");
+
+        const auto wire_dom = vortex::build_icmp_wire("www.google.com", echo, sizeof(echo));
+        expect(!wire_dom.empty() && wire_dom[1] == vortex::ATYP_DOMAIN, "icmp domain wire");
+        expect(vortex::parse_icmp_wire(wire_dom, h, ic) && h == "www.google.com",
+               "icmp domain parse");
+        const auto via_dom = vortex::build_via_peer_icmp_payload(secret, wire_dom);
+        expect(vortex::parse_via_peer_icmp_payload(via_dom, sec2, wire2) && wire2 == wire_dom,
+               "via icmp domain round-trip");
     }
 
     if (g_fail) {

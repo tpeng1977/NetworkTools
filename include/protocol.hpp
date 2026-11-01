@@ -41,22 +41,29 @@ constexpr uint8_t ATYP_IPV6   = 0x04;
 //   [u8 ver=1][atyp][addr…][icmp_payload…]
 // No port field (unlike CONNECT). icmp_payload is type/code/checksum/rest:
 //   IPv4 ICMP echo = type 8/0; ICMPv6 echo = type 128/129 (ATYP_IPV6).
+// ATYP_DOMAIN: exit resolves remotely (avoids client-side GFW poison / stand-in).
 // Exit side recomputes checksum (ICMPv6 via kernel pseudo-header when csum=0).
 inline std::vector<uint8_t> build_icmp_wire(const std::string& host,
                                             const uint8_t* icmp, size_t icmp_len) {
     std::vector<uint8_t> out;
-    if (!icmp || icmp_len < 8 || icmp_len > 65535 - 32) return out;
+    if (!icmp || icmp_len < 8 || icmp_len > 65535 - 32 || host.empty()) return out;
     in_addr v4{};
     in6_addr v6{};
+    const std::string bare = strip_ip_brackets(host);
     out.push_back(1); // version
-    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) {
+    if (inet_pton(AF_INET, bare.c_str(), &v4) == 1) {
         out.push_back(ATYP_IPV4);
         const uint8_t* p = reinterpret_cast<const uint8_t*>(&v4);
         out.insert(out.end(), p, p + 4);
-    } else if (inet_pton(AF_INET6, host.c_str(), &v6) == 1) {
+    } else if (inet_pton(AF_INET6, bare.c_str(), &v6) == 1) {
         out.push_back(ATYP_IPV6);
         const uint8_t* p = reinterpret_cast<const uint8_t*>(&v6);
         out.insert(out.end(), p, p + 16);
+    } else if (bare.size() <= 255) {
+        // Domain — remote exit getaddrinfo (PROXY ping must not use poisoned A/AAAA).
+        out.push_back(ATYP_DOMAIN);
+        out.push_back(static_cast<uint8_t>(bare.size()));
+        out.insert(out.end(), bare.begin(), bare.end());
     } else {
         return {};
     }
@@ -68,7 +75,7 @@ inline bool parse_icmp_wire(const std::vector<uint8_t>& data, std::string& host,
                             std::vector<uint8_t>& icmp) {
     host.clear();
     icmp.clear();
-    if (data.size() < 1 + 1 + 4 + 8 || data[0] != 1) return false;
+    if (data.size() < 1 + 1 + 1 + 8 || data[0] != 1) return false;
     size_t off = 1;
     const uint8_t atyp = data[off++];
     if (atyp == ATYP_IPV4) {
@@ -83,6 +90,12 @@ inline bool parse_icmp_wire(const std::vector<uint8_t>& data, std::string& host,
         if (!inet_ntop(AF_INET6, data.data() + off, ip, sizeof(ip))) return false;
         host = ip;
         off += 16;
+    } else if (atyp == ATYP_DOMAIN) {
+        if (data.size() < off + 1) return false;
+        const size_t n = data[off++];
+        if (n == 0 || n > 255 || data.size() < off + n + 8) return false;
+        host.assign(reinterpret_cast<const char*>(data.data() + off), n);
+        off += n;
     } else {
         return false;
     }
@@ -105,7 +118,8 @@ inline bool parse_via_peer_icmp_payload(const std::vector<uint8_t>& data,
                                         std::vector<uint8_t>& icmp_wire) {
     if (data.empty()) return false;
     const size_t n = data[0];
-    if (n == 0 || data.size() < 1 + n + 1 + 1 + 4 + 8) return false;
+    // Min ICMP wire: ver+atyp+≥1 addr byte+8 icmp (DOMAIN); IPv4 is larger.
+    if (n == 0 || data.size() < 1 + n + 1 + 1 + 1 + 8) return false;
     peer_secret.assign(reinterpret_cast<const char*>(data.data() + 1), n);
     icmp_wire.assign(data.begin() + 1 + static_cast<std::ptrdiff_t>(n), data.end());
     return !peer_secret.empty() && !icmp_wire.empty();

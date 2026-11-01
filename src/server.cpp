@@ -1028,13 +1028,15 @@ bool handle_icmp_direct(std::shared_ptr<ServerSession>& s, const std::vector<uin
     }
     std::vector<uint8_t> reply;
     const int timeout_ms = 3000;
-    if (!vortex::icmp_util::echo_exchange(host, req, reply, timeout_ms) || reply.empty()) {
+    int ttl = 0;
+    if (!vortex::icmp_util::echo_exchange(host, req, reply, timeout_ms, 0, &ttl) || reply.empty()) {
         std::cout << "[-] ICMP fail " << host << std::endl;
         std::cout.flush();
         vortex::send_frame(s->client_fd, s->down, vortex::CMD_CONNECT_FAIL, nullptr, 0,
                            s->cfg.padding_min, s->cfg.padding_max);
         return false;
     }
+    vortex::icmp_util::append_ttl_trailer(reply, ttl);
     if (!vortex::send_frame(s->client_fd, s->down, vortex::CMD_DATA, reply, s->cfg.padding_min,
                             s->cfg.padding_max)) {
         return false;
@@ -1044,7 +1046,8 @@ bool handle_icmp_direct(std::shared_ptr<ServerSession>& s, const std::vector<uin
     const char* kind = vortex::icmp_util::is_echo_request_v6(req.data(), req.size()) ? "ICMPv6"
                                                                                       : "ICMP";
     std::cout << "[+] " << kind << " " << host << " id=" << vortex::icmp_util::echo_id(req.data())
-              << " seq=" << vortex::icmp_util::echo_seq(req.data()) << std::endl;
+              << " seq=" << vortex::icmp_util::echo_seq(req.data()) << " ttl=" << ttl
+              << " (trailer)" << std::endl;
     std::cout.flush();
     return true;
 }

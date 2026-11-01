@@ -95,6 +95,12 @@ int main() {
   uint8_t e6[8] = {128,0,0,0,0x33,0x44,0x00,0x09};
   bool ok = one("127.0.0.1", e4, 8, false);
   ok = one("::1", e6, 8, true) && ok;
+  // PROXY-style ATYP_DOMAIN: exit getaddrinfo("localhost") → loopback echo.
+  if (ok) {
+    const bool dom = one("localhost", e4, 8, false);
+    std::printf("%s: Vortex CMD_ICMP ATYP_DOMAIN localhost\n", dom ? "PASS" : "FAIL");
+    ok = dom && ok;
+  }
   net_cleanup();
   return ok ? 0 : 1;
 }
@@ -143,6 +149,25 @@ PY
   if ! grep -q "IPv4/ICMPv6" /tmp/vortex-icmp-ln.log; then
     echo "WARN: log missing ICMPv6 marker (older binary?)"
   fi
+  if ! grep -q "icmp-ip-exit\|PROXY=SOCKS DoT\|PROXY CMD_ICMP with IP" /tmp/vortex-icmp-ln.log; then
+    echo "WARN: log missing build/ICMP IP-exit banner (older binary?)"
+  fi
+  # Client-only path: IP literal wire works on old exit; DOMAIN gets CONNECT_FAIL.
+  cat > /tmp/vortex-icmp-atyp-check.cpp <<'CPP'
+#include "protocol.hpp"
+#include <cstdio>
+int main() {
+  uint8_t e[8]={8,0,0,0,1,2,0,3};
+  auto ip = vortex::build_icmp_wire("142.251.152.119", e, 8);
+  auto dom = vortex::build_icmp_wire("www.google.com", e, 8);
+  if (ip.empty() || ip[1] != vortex::ATYP_IPV4) return 1;
+  if (dom.empty() || dom[1] != vortex::ATYP_DOMAIN) return 2;
+  std::printf("PASS: PROXY ICMP prefers ATYP_IPV4 for real dst; DOMAIN reserved for stand-in\n");
+  return 0;
+}
+CPP
+  g++ -std=c++17 -O2 -Iinclude /tmp/vortex-icmp-atyp-check.cpp -o /tmp/vortex-icmp-atyp-check
+  /tmp/vortex-icmp-atyp-check || { echo "FAIL: ICMP atyp preference"; exit 1; }
   # DIRECT private/loopback should ACCEPT
   if ping -c 1 -W 2 127.0.0.1 >/dev/null; then
     echo "[+] ping 127.0.0.1 (DIRECT/private accept) ok"
@@ -154,6 +179,40 @@ PY
   else
     echo "FAIL: ping6 ::1"; exit 1
   fi
+  # Unit-level inject address contract + PROXY domain wire (anti-poison).
+  cat > /tmp/vortex-icmp-inject-check.cpp <<'CPP'
+#include "icmp_util.hpp"
+#include "protocol.hpp"
+#include <arpa/inet.h>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+int main() {
+  uint8_t r[8] = {0,0,0,0,1,2,0,3};
+  in_addr t{}, c{};
+  inet_pton(AF_INET, "104.244.42.197", &t);
+  inet_pton(AF_INET, "192.168.0.106", &c);
+  auto p = vortex::icmp_util::build_echo_reply_ip4(t.s_addr, c.s_addr, r, 8);
+  if (p.size() != 28) return 1;
+  uint32_t s=0,d=0; std::memcpy(&s,p.data()+12,4); std::memcpy(&d,p.data()+16,4);
+  if (s != t.s_addr || d != c.s_addr) return 2;
+  uint8_t e4[8] = {8,0,0,0,1,2,0,3};
+  auto w = vortex::build_icmp_wire("www.google.com", e4, 8);
+  if (w.empty() || w[1] != vortex::ATYP_DOMAIN) return 3;
+  std::string host; std::vector<uint8_t> body;
+  if (!vortex::parse_icmp_wire(w, host, body) || host != "www.google.com") return 4;
+  // GFW poison literals stay ATYP_IP* (linux_network prefers learned domain instead).
+  auto poison4 = vortex::build_icmp_wire("185.45.5.35", e4, 8);
+  auto poison6 = vortex::build_icmp_wire("2001::1", e4, 8);
+  if (poison4.empty() || poison4[1] != vortex::ATYP_IPV4) return 5;
+  if (poison6.empty() || poison6[1] != vortex::ATYP_IPV6) return 6;
+  std::printf("PASS: inject src=target + PROXY domain wire\n");
+  return 0;
+}
+CPP
+  g++ -std=c++17 -O2 -Iinclude /tmp/vortex-icmp-inject-check.cpp -o /tmp/vortex-icmp-inject-check
+  /tmp/vortex-icmp-inject-check || { echo "FAIL: inject address contract"; exit 1; }
   kill -INT "$LPID" 2>/dev/null || true
   sleep 1
   echo "[+] linux_network ICMP/ICMPv6 smoke ok"

@@ -8,13 +8,17 @@
 //   1) In-process MultiLink SOCKS5 on 127.0.0.1
 //   2) iptables OUTPUT: own SO_MARK traffic NEVER hijacked (no self-bite)
 //   3) Sticky redir-host DNS via REDIRECT UDP/53 → local DNS
-//      (A only; AAAA→NODATA — transparent path is IPv4 iptables; PROXY would
-//       leak on native IPv6 if real AAAA were returned)
+//      DIRECT: uplink UDP (fast CN). PROXY: SOCKS DNS-over-TCP (anti-poison;
+//      avoids google→185.45.5.35 / 2001::1). A+AAAA both returned (ping6 needs
+//      AAAA); divert installs gai.conf IPv4-prefer so plain `ping` uses A while
+//      `ping6`/`ping -6` still force AAAA. FILTER6 rejects native IPv6 TCP/UDP
+//      so PROXY apps cannot leak off the IPv4 transparent path.
 //   4) TCP REDIRECT → local transparent port:
 //        learned IP → SOCKS CONNECT(domain) → MultiLink
 //        unlearned  → marked direct (WinDivert reinject equivalent)
 //   5) REJECT UDP/443+853 so stacks fall back to TCP
 //   6) ICMP/ICMPv6 echo-request NFQUEUE → rules; DIRECT=ACCEPT, else Vortex CMD_ICMP + inject
+//      (reply inject uses IP_HDRINCL / IPv6 raw so from=<echo-request dst>)
 //
 // DIRECT egress (SOCKS + transparent→SOCKS domain): dual-stack DNS-over-TCP
 // (AAAA then A), IPv6-prefer connect with IPv4 fallback — aligned with multilink.
@@ -35,6 +39,7 @@
 #include "rules.hpp"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -62,8 +67,10 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1102,6 +1109,9 @@ std::mutex g_dns_mu;
 struct DnsNameEntry { std::string name; };
 std::unordered_map<uint32_t, DnsNameEntry> g_ip_to_name;
 std::unordered_map<std::string, uint32_t> g_name_to_ip;
+// AAAA → name for ICMPv6 rule decisions (ping6 www.x after DNS divert).
+std::unordered_map<std::string, std::string> g_ip6_to_name;
+std::unordered_map<std::string, in6_addr> g_name_to_ip6;
 constexpr uint32_t kDnsTtl = 300;
 constexpr uint32_t kStandInHostMin = 0xC6120101u; // 198.18.1.1
 constexpr uint32_t kStandInHostMax = 0xC613FFFEu;
@@ -1238,6 +1248,21 @@ std::string dns_lookup_name(uint32_t net_order) {
     auto it = g_ip_to_name.find(net_order);
     return it == g_ip_to_name.end() ? std::string{} : it->second.name;
 }
+std::string dns_lookup_name6(const in6_addr& a) {
+    const std::string key = ip6_to_string(a);
+    std::lock_guard<std::mutex> lock(g_dns_mu);
+    auto it = g_ip6_to_name.find(key);
+    return it == g_ip6_to_name.end() ? std::string{} : it->second;
+}
+void dns_bind_name6(const std::string& qname_raw, const in6_addr& addr) {
+    const std::string qname = to_lower_host(qname_raw);
+    if (qname.empty() || qname == "?") return;
+    const std::string key = ip6_to_string(addr);
+    if (key.empty() || key == "?") return;
+    std::lock_guard<std::mutex> lock(g_dns_mu);
+    g_ip6_to_name[key] = qname;
+    g_name_to_ip6[qname] = addr;
+}
 
 void ipt_learn_add(uint32_t ip_net) {
     if (!ip_net || is_private_ip(ip_net)) return;
@@ -1341,6 +1366,28 @@ std::vector<uint8_t> dns_reply_a(const std::vector<uint8_t>& query, uint32_t ip_
     resp.push_back(0x00); resp.push_back(0x04);
     const uint8_t* p = reinterpret_cast<const uint8_t*>(&ip_net);
     resp.insert(resp.end(), p, p + 4);
+    return resp;
+}
+std::vector<uint8_t> dns_reply_aaaa(const std::vector<uint8_t>& query, const in6_addr& addr) {
+    if (query.size() < 12) return {};
+    size_t off = dns_skip_name(query.data(), query.size(), 12);
+    if (off + 4 > query.size()) return {};
+    off += 4;
+    std::vector<uint8_t> resp(query.begin(), query.begin() + static_cast<std::ptrdiff_t>(off));
+    resp[2] = static_cast<uint8_t>((resp[2] & 0x01) | 0x80);
+    resp[3] = 0x80;
+    resp[6] = 0; resp[7] = 1;
+    resp[8] = resp[9] = resp[10] = resp[11] = 0;
+    resp.push_back(0xC0); resp.push_back(0x0C);
+    resp.push_back(0x00); resp.push_back(0x1C); // type AAAA
+    resp.push_back(0x00); resp.push_back(0x01);
+    resp.push_back(static_cast<uint8_t>(kDnsTtl >> 24));
+    resp.push_back(static_cast<uint8_t>(kDnsTtl >> 16));
+    resp.push_back(static_cast<uint8_t>(kDnsTtl >> 8));
+    resp.push_back(static_cast<uint8_t>(kDnsTtl));
+    resp.push_back(0x00); resp.push_back(0x10);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&addr);
+    resp.insert(resp.end(), p, p + 16);
     return resp;
 }
 
@@ -1448,6 +1495,104 @@ bool resolve_ipv4_fast(const std::string& name, uint32_t client_resolver_net, ui
     auto try_udp = [&](uint32_t resolver) -> DnsAResult {
         if (!resolver) return DnsAResult::Fail;
         return resolve_ipv4_dns_udp(name, resolver, out_net, 600);
+    };
+    DnsAResult r = try_udp(client_resolver_net);
+    if (r == DnsAResult::Ok) return true;
+    if (r == DnsAResult::NoData) return false;
+    const uint32_t r88 = htonl(0x08080808u);
+    const uint32_t r1111 = htonl(0x01010101u);
+    if (client_resolver_net != r88) {
+        r = try_udp(r88);
+        if (r == DnsAResult::Ok) return true;
+        if (r == DnsAResult::NoData) return false;
+    }
+    if (client_resolver_net != r1111) {
+        r = try_udp(r1111);
+        if (r == DnsAResult::Ok) return true;
+        if (r == DnsAResult::NoData) return false;
+    }
+    return false;
+}
+
+DnsAResult parse_dns_aaaa_answer(const uint8_t* resp, size_t rlen, in6_addr& out) {
+    std::memset(&out, 0, sizeof(out));
+    if (!resp || rlen < 12) return DnsAResult::Fail;
+    const uint8_t rcode = static_cast<uint8_t>(resp[3] & 0x0F);
+    if (rcode == 3) return DnsAResult::NoData;
+    if (rcode != 0) return DnsAResult::Fail;
+    const uint16_t ancount = static_cast<uint16_t>((resp[6] << 8) | resp[7]);
+    auto skip_name = [&](size_t off) -> size_t {
+        int hops = 0;
+        while (off < rlen && hops < 64) {
+            const uint8_t lab = resp[off];
+            if (lab == 0) return off + 1;
+            if ((lab & 0xC0) == 0xC0) return off + 2 < rlen ? off + 2 : rlen;
+            if (off + 1 + lab > rlen) return rlen;
+            off += 1 + lab; ++hops;
+        }
+        return rlen;
+    };
+    size_t off = skip_name(12);
+    if (off + 4 > rlen) return DnsAResult::Fail;
+    off += 4;
+    bool saw = false;
+    for (uint16_t ai = 0; ai < ancount && off + 10 <= rlen; ++ai) {
+        off = skip_name(off);
+        if (off + 10 > rlen) return DnsAResult::Fail;
+        const uint16_t typ = static_cast<uint16_t>((resp[off] << 8) | resp[off + 1]);
+        const uint16_t rdlen = static_cast<uint16_t>((resp[off + 8] << 8) | resp[off + 9]);
+        off += 10;
+        if (off + rdlen > rlen) return DnsAResult::Fail;
+        saw = true;
+        if (typ == 28 && rdlen == 16) {
+            std::memcpy(&out, resp + off, 16);
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(&out);
+            if (!rules::is_private_ipv6(b)) return DnsAResult::Ok;
+        }
+        off += rdlen;
+    }
+    return saw || ancount == 0 ? DnsAResult::NoData : DnsAResult::Fail;
+}
+
+DnsAResult resolve_ipv6_dns_udp(const std::string& name, uint32_t resolver_net, in6_addr& out,
+                                int timeout_ms = 1500) {
+    if (name.empty() || name.size() > 253 || !resolver_net) return DnsAResult::Fail;
+    const auto q = build_dns_query(
+        name, 28,
+        static_cast<uint16_t>(std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFF));
+    if (q.empty()) return DnsAResult::Fail;
+    socket_t s = linux_self::udp_socket_marked();
+    if (s == INVALID_SOCK) return DnsAResult::Fail;
+    timeval tv{};
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(53);
+    dst.sin_addr.s_addr = resolver_net;
+    if (sendto(s, q.data(), q.size(), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) < 0) {
+        linux_self::unregister_socket(s);
+        net_close(s);
+        return DnsAResult::Fail;
+    }
+    uint8_t buf[2048];
+    const int n = static_cast<int>(recvfrom(s, buf, sizeof(buf), 0, nullptr, nullptr));
+    linux_self::unregister_socket(s);
+    net_close(s);
+    if (n < 12) return DnsAResult::Fail;
+    return parse_dns_aaaa_answer(buf, static_cast<size_t>(n), out);
+}
+
+bool resolve_ipv6_fast(const std::string& name, uint32_t client_resolver_net, in6_addr& out) {
+    in6_addr lit{};
+    if (inet_pton(AF_INET6, strip_ip_brackets(name).c_str(), &lit) == 1) {
+        out = lit;
+        return !rules::is_private_ipv6(reinterpret_cast<const uint8_t*>(&out));
+    }
+    auto try_udp = [&](uint32_t resolver) -> DnsAResult {
+        if (!resolver) return DnsAResult::Fail;
+        return resolve_ipv6_dns_udp(name, resolver, out, 600);
     };
     DnsAResult r = try_udp(client_resolver_net);
     if (r == DnsAResult::Ok) return true;
@@ -1585,6 +1730,64 @@ socket_t socks5_connect_host(const std::string& host, uint16_t port, int timeout
     return s;
 }
 
+// DNS-over-TCP via in-process SOCKS → public resolver (PROXY answers must not
+// use poisoned uplink UDP: google A=185.45.5.35 / AAAA=2001::1).
+bool socks5_dns_tcp_transact(uint16_t qtype, const std::string& name,
+                             std::vector<uint8_t>& resp, int timeout_sec = 8) {
+    resp.clear();
+    const auto q = build_dns_query(
+        name, qtype,
+        static_cast<uint16_t>(std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFF));
+    if (q.empty()) return false;
+    socket_t s = socks5_connect_host("8.8.8.8", 53, timeout_sec);
+    if (s == INVALID_SOCK) s = socks5_connect_host("1.1.1.1", 53, timeout_sec);
+    if (s == INVALID_SOCK) return false;
+    set_timeouts(s, timeout_sec);
+    const uint8_t lenb[2] = {static_cast<uint8_t>(q.size() >> 8),
+                             static_cast<uint8_t>(q.size() & 0xFF)};
+    if (!send_all_buf(s, lenb, 2) || !send_all_buf(s, q.data(), q.size())) {
+        linux_self::unregister_socket(s);
+        net_close(s);
+        return false;
+    }
+    uint8_t rlenb[2];
+    if (!recvn(s, reinterpret_cast<char*>(rlenb), 2)) {
+        linux_self::unregister_socket(s);
+        net_close(s);
+        return false;
+    }
+    const size_t rlen = (static_cast<size_t>(rlenb[0]) << 8) | rlenb[1];
+    if (rlen < 12 || rlen > 4096) {
+        linux_self::unregister_socket(s);
+        net_close(s);
+        return false;
+    }
+    resp.resize(rlen);
+    if (!recvn(s, reinterpret_cast<char*>(resp.data()), static_cast<int>(rlen))) {
+        linux_self::unregister_socket(s);
+        net_close(s);
+        resp.clear();
+        return false;
+    }
+    linux_self::unregister_socket(s);
+    net_close(s);
+    return true;
+}
+
+bool resolve_ipv4_via_socks(const std::string& name, uint32_t& out_net) {
+    out_net = 0;
+    std::vector<uint8_t> resp;
+    if (!socks5_dns_tcp_transact(1, name, resp)) return false;
+    return parse_dns_a_answer(resp.data(), resp.size(), out_net) == DnsAResult::Ok;
+}
+
+bool resolve_ipv6_via_socks(const std::string& name, in6_addr& out) {
+    std::memset(&out, 0, sizeof(out));
+    std::vector<uint8_t> resp;
+    if (!socks5_dns_tcp_transact(28, name, resp)) return false;
+    return parse_dns_aaaa_answer(resp.data(), resp.size(), out) == DnsAResult::Ok;
+}
+
 bool is_doh_host(const std::string& host) {
     const std::string h = to_lower_host(host);
     if (h == "dns.google" || h == "dns.google.com") return true;
@@ -1676,6 +1879,118 @@ void handle_transparent_tcp(socket_t client) {
     net_close(client);
 }
 
+// ---- ping = IPv4 only, ping6 = IPv6 only -----------------------------------
+// iputils ping (>=2019) is dual-stack: it calls getaddrinfo(AF_UNSPEC) and
+// glibc (RFC 6724) sorts a global AAAA before A, so plain `ping host` picks
+// IPv6 even though DNS answers are correct per QTYPE. Browsers etc. need AAAA,
+// so we only answer NODATA to AAAA queries issued by a *plain* ping process
+// (argv0 != ping6, no -6). `ping -6` / `ping6` keep AAAA; `ping -4` never asks.
+// Disable with VORTEX_PING_IPV4_ONLY=0.
+bool ping_ipv4_only_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("VORTEX_PING_IPV4_ONLY");
+        return !(e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F'));
+    }();
+    return on;
+}
+
+// UDP socket inodes bound to local port (from /proc/net/udp[6]).
+std::vector<uint64_t> udp_inodes_for_port(uint16_t port) {
+    std::vector<uint64_t> out;
+    for (const char* path : {"/proc/net/udp", "/proc/net/udp6"}) {
+        std::ifstream f(path);
+        std::string line;
+        std::getline(f, line); // header
+        while (std::getline(f, line)) {
+            unsigned sl = 0, lport = 0;
+            char laddr[64] = {0};
+            if (std::sscanf(line.c_str(), " %u: %63[0-9A-Fa-f]:%x", &sl, laddr, &lport) != 3) continue;
+            if (lport != port) continue;
+            // fields: sl local rem st tx:rx tr:when retrnsmt uid timeout inode
+            std::istringstream is(line);
+            std::string tok;
+            for (int i = 0; i < 10 && (is >> tok); ++i) {}
+            if (is) {
+                const uint64_t ino = std::strtoull(tok.c_str(), nullptr, 10);
+                if (ino) out.push_back(ino);
+            }
+        }
+    }
+    return out;
+}
+
+// True if argv (of a ping process) asks for IPv6.
+bool ping_argv_wants_v6(const std::vector<std::string>& argv) {
+    if (argv.empty()) return false;
+    std::string a0 = argv[0];
+    const size_t slash = a0.find_last_of('/');
+    if (slash != std::string::npos) a0 = a0.substr(slash + 1);
+    if (a0 == "ping6") return true;
+    // iputils short options that consume an argument (stop scanning a cluster).
+    static const std::string kArgOpts = "cFIilmMNpQsStTwW";
+    for (size_t i = 1; i < argv.size(); ++i) {
+        const std::string& a = argv[i];
+        if (a == "--") break;
+        if (a == "--ipv6") return true;
+        if (a.size() < 2 || a[0] != '-' || a[1] == '-') continue;
+        for (size_t k = 1; k < a.size(); ++k) {
+            if (a[k] == '6') return true;
+            if (kArgOpts.find(a[k]) != std::string::npos) break;
+        }
+    }
+    return false;
+}
+
+// Peer UDP port belongs to a plain (IPv4-only) ping process?
+bool dns_client_is_plain_ping(uint16_t peer_port_host) {
+    if (!ping_ipv4_only_enabled()) return false;
+    DIR* proc = ::opendir("/proc");
+    if (!proc) return false;
+    std::vector<int> pids;
+    while (dirent* de = ::readdir(proc)) {
+        if (de->d_name[0] < '1' || de->d_name[0] > '9') continue;
+        const int pid = std::atoi(de->d_name);
+        std::ifstream cf("/proc/" + std::to_string(pid) + "/comm");
+        std::string comm;
+        if (cf && std::getline(cf, comm) && (comm == "ping" || comm == "ping6")) pids.push_back(pid);
+    }
+    ::closedir(proc);
+    if (pids.empty()) return false; // cheap fast path for every other client
+
+    std::unordered_set<std::string> want;
+    for (uint64_t ino : udp_inodes_for_port(peer_port_host))
+        want.insert("socket:[" + std::to_string(ino) + "]");
+    if (want.empty()) return false;
+    for (int pid : pids) {
+        const std::string fdd = "/proc/" + std::to_string(pid) + "/fd";
+        DIR* d = ::opendir(fdd.c_str());
+        if (!d) continue;
+        bool owns = false;
+        while (dirent* de = ::readdir(d)) {
+            if (de->d_name[0] == '.') continue;
+            char buf[64];
+            const ssize_t n = ::readlink((fdd + "/" + de->d_name).c_str(), buf, sizeof(buf) - 1);
+            if (n <= 0) continue;
+            buf[n] = 0;
+            if (want.count(buf)) { owns = true; break; }
+        }
+        ::closedir(d);
+        if (!owns) continue;
+        std::ifstream cf("/proc/" + std::to_string(pid) + "/cmdline", std::ios::binary);
+        std::string raw((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
+        std::vector<std::string> argv;
+        size_t st = 0;
+        while (st < raw.size()) {
+            const size_t z = raw.find('\0', st);
+            const size_t e = z == std::string::npos ? raw.size() : z;
+            argv.emplace_back(raw.substr(st, e - st));
+            st = e + 1;
+        }
+        return !ping_argv_wants_v6(argv);
+    }
+    return false;
+}
+
 void handle_dns_query(const uint8_t* data, size_t len, const sockaddr_in& peer) {
     if (len < 12 || len > 1500) return;
     std::vector<uint8_t> query(data, data + len);
@@ -1693,16 +2008,71 @@ void handle_dns_query(const uint8_t* data, size_t len, const sockaddr_in& peer) 
         }
     };
 
-    // Transparent divert is IPv4 iptables REDIRECT only — no ip6tables TPROXY for
-    // all flows. AAAA→NODATA keeps apps on learned A → SOCKS CONNECT(domain);
-    // the router DIRECT path then does dual-stack IPv6-prefer egress. Returning
-    // real AAAA here would bypass PROXY rules on native IPv6.
-    if (qtype != 1) {
+    // A (TCP divert) + AAAA (ping6 hostname). Other types → NODATA.
+    // PROXY answers use SOCKS DNS-over-TCP (not poisoned uplink UDP).
+    // Real AAAA alone would let apps dial PROXY destinations natively over IPv6
+    // (no TPROXY); VORTEX_FILTER6 rejects outbound IPv6 TCP/UDP to keep PROXY
+    // on the IPv4 learned path while ICMPv6 still NFQUEUEs for diagnostics.
+    if (qtype != 1 && qtype != 28) {
         reply(dns_reply_nodata(query), "type" + std::to_string(qtype) + "->NODATA", true);
         return;
     }
     if (qname.empty() || qname == "?") {
         reply(dns_reply_servfail(query), "bad qname->SERVFAIL", false);
+        return;
+    }
+    const auto dns_decision =
+        router_detail::g_rules.decide(qname, /*has_ip=*/false, 0, /*allow_dns_resolve=*/false);
+    const bool proxy_dns = dns_decision.action == rules::Action::Proxy;
+    if (qtype == 28 && dns_client_is_plain_ping(ntohs(peer.sin_port))) {
+        reply(dns_reply_nodata(query), "AAAA->NODATA (plain ping = IPv4 only)", true);
+        return;
+    }
+    if (qtype == 28) {
+        {
+            std::lock_guard<std::mutex> lock(g_dns_mu);
+            auto it = g_name_to_ip6.find(qname);
+            if (it != g_name_to_ip6.end()) {
+                reply(dns_reply_aaaa(query, it->second),
+                      "cached AAAA " + ip6_to_string(it->second), true);
+                return;
+            }
+        }
+        if (g_dns_inflight.load() >= g_cfg.max_dns_inflight) {
+            reply(dns_reply_servfail(query), "overloaded->SERVFAIL", false);
+            return;
+        }
+        ++g_dns_inflight;
+        std::thread([query, peer, qname, proxy_dns]() {
+            struct Guard { ~Guard() { --g_dns_inflight; } } guard;
+            auto reply = [&](const std::vector<uint8_t>& resp, const std::string& note, bool ok) {
+                if (resp.empty()) { ++g_dns_fail; return; }
+                sendto(g_dns_fd, resp.data(), resp.size(), 0,
+                       reinterpret_cast<const sockaddr*>(&peer), sizeof(peer));
+                if (ok) ++g_dns_ok; else ++g_dns_fail;
+                if (g_dns_log_left.fetch_sub(1) > 0) {
+                    log_line(std::string(ok ? "[+] DNS q=" : "[-] DNS q=") + qname + " " + note);
+                }
+            };
+            in6_addr addr{};
+            bool ok = false;
+            if (proxy_dns) {
+                ok = resolve_ipv6_via_socks(qname, addr);
+            } else {
+                uint32_t resolver_net = 0;
+                in_addr a{};
+                if (inet_pton(AF_INET, g_uplink_dns.c_str(), &a) == 1) resolver_net = a.s_addr;
+                ok = resolve_ipv6_fast(qname, resolver_net, addr);
+            }
+            if (!ok) {
+                reply(dns_reply_nodata(query),
+                      proxy_dns ? "AAAA PROXY->NODATA" : "AAAA->NODATA", true);
+                return;
+            }
+            dns_bind_name6(qname, addr);
+            reply(dns_reply_aaaa(query, addr),
+                  std::string(proxy_dns ? "AAAA PROXY " : "AAAA ") + ip6_to_string(addr), true);
+        }).detach();
         return;
     }
     {
@@ -1719,7 +2089,7 @@ void handle_dns_query(const uint8_t* data, size_t len, const sockaddr_in& peer) 
         return;
     }
     ++g_dns_inflight;
-    std::thread([query, peer, qname]() {
+    std::thread([query, peer, qname, proxy_dns]() {
         struct Guard { ~Guard() { --g_dns_inflight; } } guard;
         auto reply = [&](const std::vector<uint8_t>& resp, const std::string& note, bool ok) {
             if (resp.empty()) { ++g_dns_fail; return; }
@@ -1730,22 +2100,25 @@ void handle_dns_query(const uint8_t* data, size_t len, const sockaddr_in& peer) 
                 log_line(std::string(ok ? "[+] DNS q=" : "[-] DNS q=") + qname + " " + note);
             }
         };
-        uint32_t resolver_net = 0;
-        {
+        uint32_t real_ip = 0;
+        bool resolved = false;
+        if (proxy_dns) {
+            resolved = resolve_ipv4_via_socks(qname, real_ip);
+        } else {
+            uint32_t resolver_net = 0;
             in_addr a{};
             if (inet_pton(AF_INET, g_uplink_dns.c_str(), &a) == 1) resolver_net = a.s_addr;
+            resolved = resolve_ipv4_fast(qname, resolver_net, real_ip);
         }
-        uint32_t real_ip = 0;
-        const bool resolved = resolve_ipv4_fast(qname, resolver_net, real_ip);
         const uint32_t answer = dns_bind_name(qname, resolved ? real_ip : 0);
         if (!answer) {
             reply(dns_reply_servfail(query), "bind failed->SERVFAIL", false);
             return;
         }
         router_detail::remember_ip_name(ntohl(answer), qname);
-        std::string note = "A " + ip_to_string(answer);
+        std::string note = std::string(proxy_dns ? "A PROXY " : "A ") + ip_to_string(answer);
         if (is_standin_ip(answer)) note += resolved ? " (stand-in/collision)" : " (stand-in/no-resolve)";
-        else if (resolved) note += " (redir-host)";
+        else if (resolved) note += proxy_dns ? " (remote)" : " (redir-host)";
         reply(dns_reply_a(query, answer), note, true);
     }).detach();
 }
@@ -1789,12 +2162,20 @@ constexpr uint16_t kIcmpQueueNum = 21570;
 std::atomic<uint64_t> g_icmp_ok{0}, g_icmp_fail{0}, g_icmp_direct{0};
 int g_nfq_fd = -1;
 
+// Prefer IP literals in CMD_ICMP — remote servers before ATYP_DOMAIN support
+// answer CONNECT_FAIL for domain wires. Stand-in (198.18/15) still needs DOMAIN
+// (requires updated server/peer).
 bool icmp_via_vortex(const LinkEndpoint& link, const std::string& host,
-                     const std::vector<uint8_t>& req, std::vector<uint8_t>& reply) {
+                     const std::vector<uint8_t>& req, std::vector<uint8_t>& reply,
+                     std::string* err_detail = nullptr) {
     reply.clear();
+    if (err_detail) err_detail->clear();
     socket_t remote_fd = linux_self::tcp_connect_marked_hosts(
         link.uplink_hosts(), link.server_port, link.idle_timeout_sec > 0 ? link.idle_timeout_sec : 30);
-    if (remote_fd == INVALID_SOCK) return false;
+    if (remote_fd == INVALID_SOCK) {
+        if (err_detail) *err_detail = "uplink connect";
+        return false;
+    }
 
     uint64_t salt = get_random_salt();
     uint8_t salt_buf[8];
@@ -1802,6 +2183,7 @@ bool icmp_via_vortex(const LinkEndpoint& link, const std::string& host,
     if (!send_all(remote_fd, salt_buf, 8)) {
         linux_self::unregister_socket(remote_fd);
         net_close(remote_fd);
+        if (err_detail) *err_detail = "salt send";
         return false;
     }
     vortex::SessionCrypto up, down;
@@ -1823,14 +2205,45 @@ bool icmp_via_vortex(const LinkEndpoint& link, const std::string& host,
     if (!sent) {
         linux_self::unregister_socket(remote_fd);
         net_close(remote_fd);
+        if (err_detail) *err_detail = wire.empty() ? "wire build" : "frame send";
         return false;
     }
     auto frame = vortex::recv_frame(remote_fd, down, link.max_payload > 0 ? link.max_payload : 32768);
     linux_self::unregister_socket(remote_fd);
     net_close(remote_fd);
-    if (!frame.ok || frame.cmd != vortex::CMD_DATA || frame.data.empty()) return false;
+    if (!frame.ok || frame.cmd != vortex::CMD_DATA || frame.data.empty()) {
+        if (err_detail) {
+            if (!frame.ok) *err_detail = "frame recv";
+            else if (frame.cmd == vortex::CMD_CONNECT_FAIL)
+                *err_detail = "CONNECT_FAIL (exit reject/old server DOMAIN?)";
+            else
+                *err_detail = "cmd=" + std::to_string(frame.cmd);
+        }
+        return false;
+    }
     reply = std::move(frame.data);
     return true;
+}
+
+// TTL trailer diagnostics: trailer present => exit server/peer is new enough to report
+// the real reply TTL / hop limit; absent => old exit, ping shows fallback ttl=64.
+std::string ttl_log_suffix(int remote_ttl) {
+    if (remote_ttl > 0) return "  ttl=" + std::to_string(remote_ttl) + " (trailer)";
+    return "  ttl=64 (fallback: exit has no TTL trailer - upgrade server/peer)";
+}
+
+void note_icmp_ttl_trailer(const std::string& link_name, int remote_ttl, size_t req_len,
+                           size_t reply_wire_len) {
+    static std::atomic<uint64_t> no_trailer{0};
+    if (remote_ttl > 0) return;
+    const uint64_t n = ++no_trailer;
+    if (n == 1 || (n % 50) == 0) {
+        log_line("[!] ICMP reply from " + link_name + " has no TTL trailer (req_icmp_len=" +
+                 std::to_string(req_len) + " reply_len=" + std::to_string(reply_wire_len) +
+                 ", want " + std::to_string(req_len + 1) +
+                 "); exit server/peer is OLD, using ttl=64. Redeploy server/peer. (#" +
+                 std::to_string(n) + ")");
+    }
 }
 
 // Returns true → NF_ACCEPT (kernel sends). false → NF_DROP (we own the echo).
@@ -1873,31 +2286,48 @@ bool decide_icmp_packet_v4(const uint8_t* ip_pkt, size_t len) {
         return true;
     }
 
-    if (is_standin_ip(dst)) {
-        // Stand-in fake-IP is not routable on the remote exit; fail this probe.
-        ++g_icmp_fail;
-        if (g_cfg.log_connections) log_line("[-] ICMP skip stand-in " + rule_host);
-        return false; // DROP without inject → ping timeout (honest failure)
-    }
-
+    // PROXY: echo the packet dst IP on the remote (ATYP_IPV4). Prefer IP over
+    // DOMAIN so old exit servers (no ATYP_DOMAIN) still work. Stand-in → DOMAIN.
     std::vector<uint8_t> req(icmp, icmp + icmplen);
-    const std::string exit_host = ip_to_string(dst);
-    const std::string log_host = rule_host;
-    std::thread([link, exit_host, log_host, req, src]() {
-        std::vector<uint8_t> reply;
-        if (!icmp_via_vortex(link, exit_host, req, reply) || reply.empty()) {
+    std::string exit_host = ip_to_string(dst);
+    if (is_standin_ip(dst)) {
+        if (learned.empty() || learned == "?") {
             ++g_icmp_fail;
-            if (g_cfg.log_connections) log_line("[-] ICMP proxy fail " + log_host);
+            if (g_cfg.log_connections) log_line("[-] ICMP skip stand-in (no name) " + exit_host);
+            return false;
+        }
+        exit_host = learned; // needs exit with ATYP_DOMAIN support
+    }
+    const std::string log_host = rule_host;
+    // Inject: IP src = original dst (what ping expects as from=), dst = client.
+    std::thread([link, exit_host, log_host, req, src, dst]() {
+        std::vector<uint8_t> reply;
+        std::string detail;
+        if (!icmp_via_vortex(link, exit_host, req, reply, &detail) || reply.empty()) {
+            ++g_icmp_fail;
+            if (g_cfg.log_connections) {
+                log_line("[-] ICMP proxy fail " + log_host + " exit=" + exit_host +
+                         (detail.empty() ? "" : " (" + detail + ")"));
+            }
             return;
         }
-        if (vortex::icmp_util::inject_echo_reply_v4(src, reply.data(), reply.size(),
-                                                    static_cast<int>(linux_self::kMark))) {
+        const size_t reply_wire_len = reply.size();
+        const int remote_ttl = vortex::icmp_util::strip_ttl_trailer(reply, req.size());
+        note_icmp_ttl_trailer(link.name, remote_ttl, req.size(), reply_wire_len);
+        if (vortex::icmp_util::inject_echo_reply_v4(dst, src, reply.data(), reply.size(),
+                                                    static_cast<int>(linux_self::kMark),
+                                                    static_cast<uint8_t>(remote_ttl))) {
             ++g_icmp_ok;
             if (g_cfg.log_connections) {
-                log_line("[+] ICMP reply " + log_host + " via " + link.name);
+                log_line("[+] ICMP reply " + log_host + " via " + link.name +
+                         " exit=" + exit_host + " from=" + ip_to_string(dst) +
+                         ttl_log_suffix(remote_ttl));
             }
         } else {
             ++g_icmp_fail;
+            if (g_cfg.log_connections) {
+                log_line("[-] ICMP inject fail " + log_host + " from=" + ip_to_string(dst));
+            }
         }
     }).detach();
     return false; // DROP original; inject reply when Vortex returns
@@ -1914,7 +2344,9 @@ bool decide_icmp_packet_v6(const uint8_t* ip_pkt, size_t len) {
     const uint8_t* dst_bytes = reinterpret_cast<const uint8_t*>(&dst);
     if (linux_self::is_uplink_ipv6(dst) || rules::is_private_ipv6(dst_bytes)) return true;
 
-    const std::string rule_host = ip6_to_string(dst);
+    const std::string learned = dns_lookup_name6(dst);
+    const std::string exit_host = ip6_to_string(dst);
+    const std::string rule_host = learned.empty() ? exit_host : learned;
     const auto decision =
         router_detail::g_rules.decide(rule_host, /*has_ip=*/false, 0, /*allow_dns_resolve=*/false);
 
@@ -1936,24 +2368,42 @@ bool decide_icmp_packet_v6(const uint8_t* ip_pkt, size_t len) {
         return true;
     }
 
+    // PROXY: echo packet dst AAAA on remote (ATYP_IPV6). Domain only if we ever
+    // introduce v6 stand-ins; today redir-host returns real AAAA from SOCKS DNS.
+    const std::string vortex_host = exit_host;
+
     std::vector<uint8_t> req(icmp, icmp + icmplen);
-    const std::string exit_host = rule_host;
     const in6_addr src_copy = src;
-    std::thread([link, exit_host, req, src_copy]() {
+    const in6_addr dst_copy = dst;
+    // Inject: IPv6 src = original dst (what ping6 expects as from=).
+    std::thread([link, vortex_host, rule_host, req, src_copy, dst_copy]() {
         std::vector<uint8_t> reply;
-        if (!icmp_via_vortex(link, exit_host, req, reply) || reply.empty()) {
+        std::string detail;
+        if (!icmp_via_vortex(link, vortex_host, req, reply, &detail) || reply.empty()) {
             ++g_icmp_fail;
-            if (g_cfg.log_connections) log_line("[-] ICMPv6 proxy fail " + exit_host);
+            if (g_cfg.log_connections) {
+                log_line("[-] ICMPv6 proxy fail " + rule_host + " exit=" + vortex_host +
+                         (detail.empty() ? "" : " (" + detail + ")"));
+            }
             return;
         }
-        if (vortex::icmp_util::inject_echo_reply_v6(src_copy, reply.data(), reply.size(),
-                                                    static_cast<int>(linux_self::kMark))) {
+        const size_t reply_wire_len = reply.size();
+        const int remote_ttl = vortex::icmp_util::strip_ttl_trailer(reply, req.size());
+        note_icmp_ttl_trailer(link.name, remote_ttl, req.size(), reply_wire_len);
+        if (vortex::icmp_util::inject_echo_reply_v6(dst_copy, src_copy, reply.data(), reply.size(),
+                                                    static_cast<int>(linux_self::kMark),
+                                                    static_cast<uint8_t>(remote_ttl))) {
             ++g_icmp_ok;
             if (g_cfg.log_connections) {
-                log_line("[+] ICMPv6 reply " + exit_host + " via " + link.name);
+                log_line("[+] ICMPv6 reply " + rule_host + " via " + link.name +
+                         " exit=" + vortex_host + " from=" + vortex_host +
+                         ttl_log_suffix(remote_ttl));
             }
         } else {
             ++g_icmp_fail;
+            if (g_cfg.log_connections) {
+                log_line("[-] ICMPv6 inject fail " + rule_host + " from=" + vortex_host);
+            }
         }
     }).detach();
     return false;
@@ -2138,6 +2588,84 @@ std::string default_outbound_iface() {
     return dev;
 }
 
+// While divert is up we keep returning real AAAA (needed for ping6 hostname), but
+// glibc getaddrinfo prefers IPv6 by default — so plain `ping host` would also pick
+// AAAA. Temporarily raise IPv4 precedence in /etc/gai.conf (RFC 3484) so:
+//   ping / ping -4 → IPv4,  ping6 / ping -6 → IPv6.
+// Restored on hijack_uninstall / restore-network-settings.sh.
+constexpr const char* kGaiConfPath = "/etc/gai.conf";
+constexpr const char* kGaiMarkerBegin = "# BEGIN VORTEX_GAI_IPV4_PREFER";
+constexpr const char* kGaiMarkerEnd = "# END VORTEX_GAI_IPV4_PREFER";
+
+bool gai_prefer_ipv4_installed() {
+    std::ifstream in(kGaiConfPath);
+    if (!in) return false;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find(kGaiMarkerBegin) != std::string::npos) return true;
+    }
+    return false;
+}
+
+void gai_prefer_ipv4_uninstall() {
+    std::ifstream in(kGaiConfPath);
+    if (!in) return;
+    std::vector<std::string> keep;
+    bool skipping = false;
+    bool changed = false;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find(kGaiMarkerBegin) != std::string::npos) {
+            skipping = true;
+            changed = true;
+            continue;
+        }
+        if (skipping) {
+            if (line.find(kGaiMarkerEnd) != std::string::npos) skipping = false;
+            continue;
+        }
+        keep.push_back(line);
+    }
+    in.close();
+    if (!changed) return;
+    std::ofstream out(kGaiConfPath, std::ios::trunc);
+    if (!out) {
+        log_line("[-] gai.conf restore failed (cannot write " + std::string(kGaiConfPath) + ")");
+        return;
+    }
+    for (size_t i = 0; i < keep.size(); ++i) {
+        out << keep[i] << '\n';
+    }
+    log_line("[*] gai.conf: removed IPv4-prefer block (ping dual-stack default restored)");
+}
+
+bool gai_prefer_ipv4_install() {
+    if (gai_prefer_ipv4_installed()) return true;
+    // Any precedence line replaces glibc defaults — write the full table with
+    // ::ffff:0:0/96 raised to 100 (Ubuntu gai.conf "prefer IPv4" recipe).
+    std::ofstream out(kGaiConfPath, std::ios::app);
+    if (!out) {
+        log_line("[-] gai.conf IPv4-prefer install failed (need write " +
+                 std::string(kGaiConfPath) + ")");
+        return false;
+    }
+    out << '\n'
+        << kGaiMarkerBegin << '\n'
+        << "# linux_network divert: plain ping → IPv4; ping6 → IPv6 (AAAA still answered)\n"
+        << "precedence  ::1/128       50\n"
+        << "precedence  ::/0          40\n"
+        << "precedence  2002::/16     30\n"
+        << "precedence ::/96          20\n"
+        << "precedence ::ffff:0:0/96  100\n"
+        << kGaiMarkerEnd << '\n';
+    if (!out) {
+        log_line("[-] gai.conf IPv4-prefer write incomplete");
+        return false;
+    }
+    log_line("[*] gai.conf: IPv4-prefer enabled (ping→v4, ping6→v6; AAAA kept for ping6)");
+    return true;
+}
+
 std::string find_restore_settings_script() {
     // cwd (repo or dist package), then next to the binary.
     const char* cands[] = {
@@ -2206,6 +2734,11 @@ void hijack_uninstall() {
         }
         run_cmd("ip6tables -t mangle -F VORTEX_ICMP6 2>/dev/null");
         run_cmd("ip6tables -t mangle -X VORTEX_ICMP6 2>/dev/null");
+        for (int i = 0; i < 5; ++i) {
+            if (run_cmd("ip6tables -t filter -D OUTPUT -j VORTEX_FILTER6 2>/dev/null") != 0) break;
+        }
+        run_cmd("ip6tables -t filter -F VORTEX_FILTER6 2>/dev/null");
+        run_cmd("ip6tables -t filter -X VORTEX_FILTER6 2>/dev/null");
         run_cmd(ip + " addr del 198.18.0.1/15 dev lo 2>/dev/null");
         const std::string iface = default_outbound_iface();
         if (!iface.empty() && ::access("/usr/bin/resolvectl", X_OK) == 0) {
@@ -2217,6 +2750,8 @@ void hijack_uninstall() {
             run_cmd("nmcli device reapply " + iface + " 2>/dev/null");
         }
     }
+    // Always strip our gai.conf block (script may already have; idempotent).
+    gai_prefer_ipv4_uninstall();
     g_dns_restore_iface.clear();
     g_hijack_installed = false;
     {
@@ -2330,6 +2865,34 @@ bool hijack_install() {
         // ICMPv6 echo-request (type 128) → same NFQUEUE as IPv4; userspace decides.
         run_cmd(ip6t + " -t mangle -A VORTEX_ICMP6 -p icmpv6 --icmpv6-type echo-request -j NFQUEUE --queue-num " +
                 std::to_string(kIcmpQueueNum) + " --queue-bypass 2>/dev/null");
+
+        // Reject native IPv6 TCP/UDP so returning real AAAA for ping6 does not
+        // let PROXY destinations bypass the IPv4 transparent path. Marked /
+        // private / uplink still RETURN. ICMPv6 is handled above (mangle).
+        run_cmd(ip6t + " -t filter -N VORTEX_FILTER6 2>/dev/null || " + ip6t +
+                " -t filter -F VORTEX_FILTER6 2>/dev/null");
+        run_cmd(ip6t + " -t filter -D OUTPUT -j VORTEX_FILTER6 2>/dev/null");
+        run_cmd(ip6t + " -t filter -I OUTPUT 1 -j VORTEX_FILTER6 2>/dev/null");
+        run_cmd(ip6t + " -t filter -F VORTEX_FILTER6 2>/dev/null");
+        run_cmd(ip6t + " -t filter -A VORTEX_FILTER6 -m mark --mark " + mark +
+                " -j RETURN 2>/dev/null");
+        run_cmd(ip6t + " -t filter -A VORTEX_FILTER6 -d ::1/128 -j RETURN 2>/dev/null");
+        run_cmd(ip6t + " -t filter -A VORTEX_FILTER6 -d fc00::/7 -j RETURN 2>/dev/null");
+        run_cmd(ip6t + " -t filter -A VORTEX_FILTER6 -d fe80::/10 -j RETURN 2>/dev/null");
+        for (const auto& kv : linux_router::g_cfg.links) {
+            for (const auto& host : kv.second.uplink_hosts()) {
+                in6_addr v6{};
+                if (inet_pton(AF_INET6, strip_ip_brackets(host).c_str(), &v6) != 1) continue;
+                run_cmd(ip6t + " -t filter -A VORTEX_FILTER6 -d " + strip_ip_brackets(host) +
+                        " -j RETURN 2>/dev/null");
+            }
+        }
+        run_cmd(ip6t +
+                " -t filter -A VORTEX_FILTER6 -p tcp -j REJECT --reject-with tcp-reset "
+                "2>/dev/null");
+        run_cmd(ip6t +
+                " -t filter -A VORTEX_FILTER6 -p udp -j REJECT --reject-with "
+                "icmp6-port-unreachable 2>/dev/null");
     }
 
     // Do NOT rewrite resolvectl — that survives Ctrl+C poorly (empty DNS after
@@ -2340,11 +2903,14 @@ bool hijack_install() {
         run_cmd("resolvectl flush-caches 2>/dev/null");
     }
 
+    // Keep AAAA answers for ping6, but make plain `ping` prefer IPv4 via gai.conf.
+    gai_prefer_ipv4_install();
+
     g_hijack_installed = true;
     log_line("[*] divert: UDP/53→:" + std::to_string(kDnsListenPort) +
              "  learned TCP→:" + std::to_string(kTcpListenPort) +
              "  ICMP NFQUEUE q=" + std::to_string(kIcmpQueueNum) +
-             "  unlearned=passthru(reinject)  own mark=" + mark);
+             "  A+AAAA + gai IPv4-prefer + FILTER6  unlearned=passthru  own mark=" + mark);
     return true;
 }
 
@@ -2431,13 +2997,20 @@ void resolve_multilink_paths(MultilinkConfig& cfg, const std::string& config_pat
 
 } // namespace
 
+// Bump when ICMP/DNS divert semantics change — shown in --version and boot banner.
+constexpr const char* kLinuxNetworkBuild = "2026.11.01-ping-v4-prefer";
+
 int main(int argc, char** argv) {
     std::string config_path = "config/internet.json";
     bool router_only = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--router-only") router_only = true;
-        else if (!a.empty() && a[0] != '-') config_path = a;
+        else if (a == "--version" || a == "-V") {
+            std::cout << "linux_network " << kLinuxNetworkBuild
+                      << " (PROXY DNS=SOCKS DoT; PROXY ICMP=IP literal exit)\n";
+            return 0;
+        } else if (!a.empty() && a[0] != '-') config_path = a;
     }
 
     if (!net_init()) {
@@ -2508,7 +3081,8 @@ int main(int argc, char** argv) {
     }
 
     // Match internet.cpp startup logs.
-    log_line("[*] LinuxNetwork — transparent redir-host + MultiLink (internet.cpp aligned, no TUN)");
+    log_line(std::string("[*] LinuxNetwork ") + kLinuxNetworkBuild +
+             " — transparent redir-host + MultiLink (internet.cpp aligned, no TUN)");
     log_line("[*] config " + config_path);
     log_line("[*] router SOCKS 127.0.0.1:" + std::to_string(g_cfg.socks5_port) +
              "  links=" + std::to_string(ml.links.size()) +
@@ -2516,7 +3090,8 @@ int main(int argc, char** argv) {
     log_line("[*] filter: outbound UDP/53 + learned TCP + ICMP echo + QUIC drop; not mark/LAN/uplink");
     log_line("[*] self-exclude: SO_MARK " + mark_hex() + " + registered sports + Vortex server IPs");
     log_line("[*] apps: no proxy settings; DNS sticky map; TCP CONNECT(domain) via rules");
-    log_line("[*] ICMP/ICMPv6: NFQUEUE echo-request → rules (DIRECT accept / PROXY CMD_ICMP + inject)");
+    log_line("[*] ICMP/ICMPv6: NFQUEUE → DIRECT accept / PROXY CMD_ICMP with IP literal + inject");
+    log_line("[*] DNS: DIRECT=uplink; PROXY=SOCKS DoT A+AAAA; gai IPv4-prefer → ping=v4 ping6=v6; FILTER6");
     log_line("[*] unlearned TCP: never redirected (WinDivert reinject)");
     log_line("[*] Ctrl+C restores iptables/DNS immediately; if stuck: sudo ./scripts/restore-network.sh");
 

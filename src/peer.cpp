@@ -130,13 +130,15 @@ bool handle_one_icmp_job(std::shared_ptr<PeerSession> s, const std::vector<uint8
         return true;
     }
     std::vector<uint8_t> reply;
-    if (!vortex::icmp_util::echo_exchange(host, req, reply, 3000) || reply.empty()) {
+    int ttl = 0;
+    if (!vortex::icmp_util::echo_exchange(host, req, reply, 3000, 0, &ttl) || reply.empty()) {
         vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_CONNECT_FAIL, nullptr, 0,
                            s->cfg.padding_min, s->cfg.padding_max);
         std::cout << "[-] Peer ICMP fail " << host << std::endl;
         std::cout.flush();
         return true;
     }
+    vortex::icmp_util::append_ttl_trailer(reply, ttl);
     if (!vortex::send_frame(s->server_fd, s->to_server, vortex::CMD_DATA, reply,
                             s->cfg.padding_min, s->cfg.padding_max)) {
         return false;
@@ -147,7 +149,7 @@ bool handle_one_icmp_job(std::shared_ptr<PeerSession> s, const std::vector<uint8
     }
     const char* kind = vortex::icmp_util::is_echo_request_v6(req.data(), req.size()) ? "ICMPv6"
                                                                                       : "ICMP";
-    std::cout << "[+] Peer " << kind << " " << host << std::endl;
+    std::cout << "[+] Peer " << kind << " " << host << " ttl=" << ttl << " (trailer)" << std::endl;
     std::cout.flush();
     return true;
 }

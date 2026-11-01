@@ -50,6 +50,11 @@ if [[ -x "$IP6T" ]]; then
   done
   "$IP6T" -t mangle -F VORTEX_ICMP6 2>/dev/null || true
   "$IP6T" -t mangle -X VORTEX_ICMP6 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    "$IP6T" -t filter -D OUTPUT -j VORTEX_FILTER6 2>/dev/null || break
+  done
+  "$IP6T" -t filter -F VORTEX_FILTER6 2>/dev/null || true
+  "$IP6T" -t filter -X VORTEX_FILTER6 2>/dev/null || true
 fi
 
 for chain_spec in \
@@ -105,6 +110,18 @@ if command -v resolvectl >/dev/null 2>&1; then
   fi
   resolvectl flush-caches 2>/dev/null || true
   resolvectl reset-server-features 2>/dev/null || true
+fi
+
+# Strip linux_network IPv4-prefer block from gai.conf (plain ping → v4 while divert).
+GAI=/etc/gai.conf
+if [[ -f "$GAI" ]] && grep -q 'BEGIN VORTEX_GAI_IPV4_PREFER' "$GAI" 2>/dev/null; then
+  echo "[*] restoring gai.conf (remove IPv4-prefer block)..."
+  tmp=$(mktemp)
+  awk '
+    /BEGIN VORTEX_GAI_IPV4_PREFER/ {skip=1; next}
+    /END VORTEX_GAI_IPV4_PREFER/ {skip=0; next}
+    !skip {print}
+  ' "$GAI" > "$tmp" && mv "$tmp" "$GAI" || rm -f "$tmp"
 fi
 
 rm -f /run/vortex-linux-network.lock /tmp/vortex-linux-network.lock
