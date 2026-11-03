@@ -630,12 +630,69 @@ void to_remote_udp_loop(socket_t listen_fd, FwdBinding bind, ServerConfig cfg,
     }
 }
 
+// Dual-stack UDP target so to_local UDP mux sessions can reach IPv6 as well
+// (previous code was AF_INET-only: inet_pton(AF_INET) dropped every v6 dst).
+struct UdpTarget {
+    int family = AF_UNSPEC;
+    sockaddr_storage ss{};
+    socklen_type len = 0;
+};
+
+inline bool udp_target_from_host(const std::string& host, uint16_t port, UdpTarget& t) {
+    std::memset(&t.ss, 0, sizeof(t.ss));
+    in_addr v4{};
+    in6_addr v6{};
+    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) {
+        auto* a = reinterpret_cast<sockaddr_in*>(&t.ss);
+        a->sin_family = AF_INET;
+        a->sin_port = htons(port);
+        a->sin_addr = v4;
+        t.family = AF_INET;
+        t.len = sizeof(sockaddr_in);
+        return true;
+    }
+    if (inet_pton(AF_INET6, host.c_str(), &v6) == 1) {
+        auto* a = reinterpret_cast<sockaddr_in6*>(&t.ss);
+        a->sin6_family = AF_INET6;
+        a->sin6_port = htons(port);
+        a->sin6_addr = v6;
+        t.family = AF_INET6;
+        t.len = sizeof(sockaddr_in6);
+        return true;
+    }
+    return false;
+}
+
+inline bool udp_send_to_target(socket_t fd, const uint8_t* data, size_t len,
+                               const UdpTarget& to) {
+#ifdef _WIN32
+    const int n = ::sendto(fd, reinterpret_cast<const char*>(data),
+                           static_cast<int>(len), 0,
+                           reinterpret_cast<const sockaddr*>(&to.ss), to.len);
+#else
+    const ssize_t n = ::sendto(fd, data, len, 0,
+                               reinterpret_cast<const sockaddr*>(&to.ss), to.len);
+#endif
+    return n >= 0 && static_cast<size_t>(n) == len;
+}
+
+inline int udp_recv_from_target(socket_t fd, uint8_t* data, size_t len, UdpTarget& from) {
+    from.len = sizeof(from.ss);
+#ifdef _WIN32
+    return ::recvfrom(fd, reinterpret_cast<char*>(data), static_cast<int>(len), 0,
+                      reinterpret_cast<sockaddr*>(&from.ss), &from.len);
+#else
+    return static_cast<int>(::recvfrom(fd, data, len, 0,
+                                       reinterpret_cast<sockaddr*>(&from.ss), &from.len));
+#endif
+}
+
 void run_udp_mux_server_loop_v2(std::shared_ptr<PeerConn> peer) {
     // Per-session sockets for to_local outbound so concurrent clients sharing a
     // target host:port do not steal each other's replies. Hard-capped for FDs.
     constexpr size_t kMaxLocalUdpSessions = 512;
     std::unordered_map<uint32_t, socket_t> local_sid_socks;
-    std::unordered_map<uint32_t, sockaddr_in> local_sid_target;
+    std::unordered_map<uint32_t, UdpTarget> local_sid_target;
     std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> local_sid_last;
     auto close_local_sid = [&](uint32_t sid) {
         auto it = local_sid_socks.find(sid);
@@ -728,8 +785,8 @@ void run_udp_mux_server_loop_v2(std::shared_ptr<PeerConn> peer) {
                 }
                 if (!(rev & (POLLIN | POLLERR | POLLHUP))) continue;
                 auto& kv = local_socks[i];
-                sockaddr_in from{};
-                const int n = udp_recv_from(kv.second, buf.data(), buf.size(), from);
+                UdpTarget from{};
+                const int n = udp_recv_from_target(kv.second, buf.data(), buf.size(), from);
                 if (n <= 0) {
                     // Drop sid on sticky error so poll cannot wake forever.
                     if (poll_revents_err_or_hup(rev)) close_local_sid(kv.first);
@@ -775,15 +832,14 @@ void run_udp_mux_server_loop_v2(std::shared_ptr<PeerConn> peer) {
                     // skip
                 } else if ((uflags & vortex::UDP_FLAG_TO_LOCAL) != 0) {
                     if (has_addr) {
-                        sockaddr_in tgt{};
-                        tgt.sin_family = AF_INET;
-                        tgt.sin_port = htons(addr_port);
-                        if (inet_pton(AF_INET, addr_host.c_str(), &tgt.sin_addr) == 1) {
+                        UdpTarget tgt{};
+                        if (udp_target_from_host(addr_host, addr_port, tgt)) {
                             close_local_sid(sid);
                             evict_local_if_needed();
-                            socket_t sfd = create_udp_socket();
+                            socket_t sfd = create_udp_socket(tgt.family);
                             if (sfd != INVALID_SOCK) {
-                                if (!udp_send_to(sfd, payload.data(), payload.size(), tgt)) {
+                                if (!udp_send_to_target(sfd, payload.data(), payload.size(),
+                                                         tgt)) {
                                     net_close(sfd);
                                 } else {
                                     local_sid_socks[sid] = sfd;
@@ -797,8 +853,8 @@ void run_udp_mux_server_loop_v2(std::shared_ptr<PeerConn> peer) {
                         auto tit = local_sid_target.find(sid);
                         if (it != local_sid_socks.end() && tit != local_sid_target.end()) {
                             local_sid_last[sid] = std::chrono::steady_clock::now();
-                            udp_send_to(it->second, payload.data(), payload.size(),
-                                        tit->second);
+                            udp_send_to_target(it->second, payload.data(), payload.size(),
+                                                tit->second);
                         }
                     }
                 } else {

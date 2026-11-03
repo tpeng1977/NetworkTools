@@ -577,6 +577,7 @@ struct PeerConfig {
 
 struct MultilinkConfig {
     std::string socks5_bind_ip = "127.0.0.1";
+    std::vector<std::string> socks5_bind_ips; // 新增：支持多个绑定地址
     int socks5_bind_port = 11080;
     int listen_backlog = 128;
     std::map<std::string, LinkEndpoint> links;
@@ -843,6 +844,11 @@ inline MultilinkConfig MultilinkConfig::load(const std::string& path) {
     const std::string text = ss.str();
 
     MultilinkConfig c;
+    c.socks5_bind_ips = parse_ip_list_field(text, "socks5_bind_ip");
+    c.socks5_bind_ip = get_string_in(text, "socks5_bind_ip", c.socks5_bind_ip);
+    finalize_bind_ips(c.socks5_bind_ips, c.socks5_bind_ip); // 归一化处理
+
+    c.socks5_bind_port = get_int_in(text, "socks5_bind_port", c.socks5_bind_port);
     c.socks5_bind_ip = get_string_in(text, "socks5_bind_ip", c.socks5_bind_ip);
     normalize_host_ip(c.socks5_bind_ip);
     c.socks5_bind_port = get_int_in(text, "socks5_bind_port", c.socks5_bind_port);

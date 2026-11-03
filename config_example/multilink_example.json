@@ -29,7 +29,7 @@
       "max_payload": 32768
     }
   },
-  "socks5_bind_ip": "127.0.0.1",
+  "socks5_bind_ip": ["::1","127.0.0.1"],
   "socks5_bind_port": 1080,
   "listen_backlog": 128,
   "rules_path": "config/multirules.yaml",

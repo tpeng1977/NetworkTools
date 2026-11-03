@@ -1002,7 +1002,7 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
 
 namespace linux_router {
 MultilinkConfig g_cfg;
-socket_t g_listen = INVALID_SOCK;
+std::vector<socket_t> g_listens;  // <--- 修改为 socket 向量
 
 bool start(const MultilinkConfig& cfg) {
     g_cfg = cfg;
@@ -1013,12 +1013,28 @@ bool start(const MultilinkConfig& cfg) {
         std::cerr << "[-] rules: " << e.what() << "\n";
         return false;
     }
-    g_listen = create_listen_socket("127.0.0.1", cfg.socks5_bind_port, cfg.listen_backlog);
-    if (g_listen == INVALID_SOCK) {
-        std::cerr << "[-] LinuxNetwork router bind 127.0.0.1:" << cfg.socks5_bind_port
-                  << " failed\n";
+    // 【修改点 1】遍历配置中的所有 socks5_bind_ips 进行多地址绑定
+    const auto& bind_ips = cfg.socks5_bind_ips.empty() 
+        ? std::vector<std::string>{cfg.socks5_bind_ip} 
+        : cfg.socks5_bind_ips;
+
+    g_listens.clear();
+    for (const auto& ip : bind_ips) {
+        socket_t listen_fd = create_listen_socket(ip, cfg.socks5_bind_port, cfg.listen_backlog);
+        if (listen_fd == INVALID_SOCK) {
+            std::cerr << "[-] LinuxNetwork router bind " << ip << ":" << cfg.socks5_bind_port
+                      << " failed\n";
+            continue;
+        }
+        g_listens.push_back(listen_fd);
+        std::cout << "[*] LinuxNetwork router (MultiLink) SOCKS5 bound to " << ip << ":" << cfg.socks5_bind_port << std::endl;
+    }
+
+    if (g_listens.empty()) {
+        std::cerr << "[-] LinuxNetwork router failed to bind any SOCKS5 address\n";
         return false;
     }
+
     linux_self::clear_uplink_ipv4();
     linux_self::clear_uplink_ipv6();
     for (const auto& kv : cfg.links) {
@@ -1034,18 +1050,20 @@ bool start(const MultilinkConfig& cfg) {
             }
         }
     }
-    std::thread([] {
-        while (router_detail::g_running) {
-            socket_t local_fd = accept_any(g_listen);
-            if (local_fd == INVALID_SOCK) {
-                if (!router_detail::g_running) break;
-                continue;
+    // 【修改点 2】为每一个监听套接字分别启动一个 accept 线程
+    for (socket_t listen_fd : g_listens) {
+        std::thread([listen_fd] {
+            while (router_detail::g_running) {
+                socket_t local_fd = accept_any(listen_fd);
+                if (local_fd == INVALID_SOCK) {
+                    if (!router_detail::g_running) break;
+                    continue;
+                }
+                std::thread(router_detail::handle_socks5, local_fd, g_cfg).detach();
             }
-            std::thread(router_detail::handle_socks5, local_fd, g_cfg).detach();
-        }
-    }).detach();
-    std::cout << "[*] LinuxNetwork router (MultiLink) SOCKS5 127.0.0.1:" << cfg.socks5_bind_port
-              << std::endl;
+        }).detach();
+    }
+
     std::cout << "[*] rules " << cfg.rules_path
               << " (" << router_detail::g_rules.rule_count() << " entries)"
               << "  GEOIP-CN=" << router_detail::g_rules.cn_cidr_count()
@@ -1069,10 +1087,14 @@ bool start(const MultilinkConfig& cfg) {
 
 void stop() {
     router_detail::g_running = false;
-    if (g_listen != INVALID_SOCK) {
-        net_close(g_listen);
-        g_listen = INVALID_SOCK;
+    // 安全关闭所有多地址监听套接字
+    for (socket_t fd : g_listens) {
+        if (fd != INVALID_SOCK) {
+            shutdown(fd, SHUT_RDWR);
+            net_close(fd);
+        }
     }
+    g_listens.clear();
 }
 } // namespace linux_router
 
@@ -1101,6 +1123,8 @@ std::atomic<int> g_dns_log_left{40};
 int g_lock_fd = -1;
 int g_dns_fd = -1;
 int g_tcp_fd = -1;
+int g_tcp6_fd = -1;
+std::unordered_set<std::string> g_learned_ipt6_added;
 bool g_hijack_installed = false;
 std::string g_dns_restore_iface;
 std::string g_uplink_dns = "223.5.5.5";
@@ -1254,6 +1278,20 @@ std::string dns_lookup_name6(const in6_addr& a) {
     auto it = g_ip6_to_name.find(key);
     return it == g_ip6_to_name.end() ? std::string{} : it->second;
 }
+void ipt_learn_add6(const std::string& ip6_str) {
+    if (ip6_str.empty() || ip6_str == "?") return;
+    {
+        std::lock_guard<std::mutex> lock(g_learned_ipt_mu);
+        if (g_learned_ipt6_added.count(ip6_str)) return;
+        g_learned_ipt6_added.insert(ip6_str);
+    }
+    const std::string ip6t = "ip6tables";
+    run_cmd(ip6t + " -t nat -C VORTEX_TCP6 -d " + ip6_str + " -p tcp -j REDIRECT --to-ports " +
+            std::to_string(kTcpListenPort) + " 2>/dev/null || " +
+            ip6t + " -t nat -A VORTEX_TCP6 -d " + ip6_str + " -p tcp -j REDIRECT --to-ports " +
+            std::to_string(kTcpListenPort));
+}
+
 void dns_bind_name6(const std::string& qname_raw, const in6_addr& addr) {
     const std::string qname = to_lower_host(qname_raw);
     if (qname.empty() || qname == "?") return;
@@ -1262,6 +1300,7 @@ void dns_bind_name6(const std::string& qname_raw, const in6_addr& addr) {
     std::lock_guard<std::mutex> lock(g_dns_mu);
     g_ip6_to_name[key] = qname;
     g_name_to_ip6[qname] = addr;
+    ipt_learn_add6(key);
 }
 
 void ipt_learn_add(uint32_t ip_net) {
@@ -1819,38 +1858,75 @@ void relay_both(socket_t a, socket_t b) {
 }
 
 // internet.cpp socks_worker: LEARNED only → SOCKS CONNECT(domain). Never CONNECT(IP).
-void handle_transparent_tcp(socket_t client) {
-    sockaddr_in orig{};
-    socklen_t olen = sizeof(orig);
-    if (getsockopt(client, SOL_IP, SO_ORIGINAL_DST, &orig, &olen) != 0) {
-        net_close(client);
-        return;
-    }
-    const uint32_t dst = orig.sin_addr.s_addr;
-    const uint16_t dport = ntohs(orig.sin_port);
-    const std::string learned = dns_lookup_name(dst);
+void handle_transparent_tcp(socket_t client, bool is_v6 = false) {
+    std::string learned;
+    uint16_t dport = 0;
+    std::string client_ip_str;
 
-    // internet.cpp: unlearned → reinject. Here packet was only redirected because IP
-    // was learned (or stand-in range); if map miss, marked direct (= reinject).
-    if (learned.empty()) {
-        ++g_tcp_passthru; ++g_passthru;
-        char ipbuf[INET_ADDRSTRLEN] = {};
-        inet_ntop(AF_INET, &dst, ipbuf, sizeof(ipbuf));
-        socket_t up = linux_self::tcp_connect_registered(ipbuf, dport, g_cfg.idle_timeout_sec);
-        if (up == INVALID_SOCK) {
-            ++g_tcp_fail;
+    if (!is_v6) {
+        sockaddr_in orig{};
+        socklen_t olen = sizeof(orig);
+        if (getsockopt(client, SOL_IP, SO_ORIGINAL_DST, &orig, &olen) != 0) {
             net_close(client);
             return;
         }
-        if (g_cfg.log_connections) {
-            log_line("[*] TCP passthru(reinject) " + std::string(ipbuf) + ":" + std::to_string(dport));
+        const uint32_t dst = orig.sin_addr.s_addr;
+        dport = ntohs(orig.sin_port);
+        learned = dns_lookup_name(dst);
+        client_ip_str = ip_to_string(dst);
+
+        if (learned.empty()) {
+            ++g_tcp_passthru; ++g_passthru;
+            char ipbuf[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, &dst, ipbuf, sizeof(ipbuf));
+            socket_t up = linux_self::tcp_connect_registered(ipbuf, dport, g_cfg.idle_timeout_sec);
+            if (up == INVALID_SOCK) {
+                ++g_tcp_fail;
+                net_close(client);
+                return;
+            }
+            if (g_cfg.log_connections) {
+                log_line("[*] TCP passthru(reinject) " + std::string(ipbuf) + ":" + std::to_string(dport));
+            }
+            ++g_tcp_ok;
+            relay_both(client, up);
+            linux_self::unregister_socket(up);
+            net_close(up);
+            net_close(client);
+            return;
         }
-        ++g_tcp_ok;
-        relay_both(client, up);
-        linux_self::unregister_socket(up);
-        net_close(up);
-        net_close(client);
-        return;
+    } else {
+        sockaddr_in6 orig6{};
+        socklen_t olen = sizeof(orig6);
+        // IP6T_SO_ORIGINAL_DST 在 Linux 内核中一般为 80
+        if (getsockopt(client, SOL_IPV6, 80, &orig6, &olen) != 0) {
+            net_close(client);
+            return;
+        }
+        dport = ntohs(orig6.sin6_port);
+        learned = dns_lookup_name6(orig6.sin6_addr);
+        client_ip_str = ip6_to_string(orig6.sin6_addr);
+
+        if (learned.empty()) {
+            ++g_tcp_passthru; ++g_passthru;
+            char ipbuf[INET6_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET6, &orig6.sin6_addr, ipbuf, sizeof(ipbuf));
+            socket_t up = linux_self::tcp_connect_registered(ipbuf, dport, g_cfg.idle_timeout_sec);
+            if (up == INVALID_SOCK) {
+                ++g_tcp_fail;
+                net_close(client);
+                return;
+            }
+            if (g_cfg.log_connections) {
+                log_line("[*] TCPv6 passthru(reinject) [" + std::string(ipbuf) + "]:" + std::to_string(dport));
+            }
+            ++g_tcp_ok;
+            relay_both(client, up);
+            linux_self::unregister_socket(up);
+            net_close(up);
+            net_close(client);
+            return;
+        }
     }
 
     if (is_doh_host(learned)) {
@@ -1870,7 +1946,7 @@ void handle_transparent_tcp(socket_t client) {
     }
     ++g_connect_ok; ++g_tcp_ok;
     if (g_cfg.log_connections) {
-        log_line("[+] TCP " + learned + "/" + ip_to_string(dst) + ":" + std::to_string(dport) +
+        log_line("[+] TCP " + learned + "/" + client_ip_str + ":" + std::to_string(dport) +
                  " via SOCKS5/domain");
     }
     relay_both(client, s);
@@ -2150,7 +2226,26 @@ void tcp_accept_loop() {
             break;
         }
         set_timeouts(c, std::max(30, g_cfg.idle_timeout_sec));
-        std::thread(handle_transparent_tcp, c).detach();
+        std::thread(handle_transparent_tcp, c, false).detach();
+    }
+}
+
+void tcp6_accept_loop() {
+    while (g_run.load()) {
+        if (g_tcp6_fd < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+        sockaddr_in6 peer{};
+        socklen_t plen = sizeof(peer);
+        socket_t c = accept(g_tcp6_fd, reinterpret_cast<sockaddr*>(&peer), &plen);
+        if (c == INVALID_SOCK) {
+            if (!g_run.load()) break;
+            if (errno == EINTR || errno == EAGAIN) continue;
+            break;
+        }
+        // 非 TUN 模式下安全拒绝原生 IPv6 TCP 透明重定向，回退走 IPv4 代理链
+        net_close(c);
     }
 }
 
@@ -2813,25 +2908,11 @@ bool hijack_install() {
     // REDIRECT is not fully implemented; these RETURN rules avoid hijacking
     // our own dual-stack uplinks when ip6tables is present).
     {
+        // 无 TUN 架构下，关闭 IPv6 nat REDIRECT 以避免内核卡死循环，IPv6 统一通过 SOCKS 代理
         const std::string ip6t = "ip6tables";
-        run_cmd(ip6t + " -t nat -N VORTEX_OUT6 2>/dev/null || " + ip6t +
-                " -t nat -F VORTEX_OUT6 2>/dev/null");
         run_cmd(ip6t + " -t nat -D OUTPUT -j VORTEX_OUT6 2>/dev/null");
-        run_cmd(ip6t + " -t nat -I OUTPUT 1 -j VORTEX_OUT6 2>/dev/null");
         run_cmd(ip6t + " -t nat -F VORTEX_OUT6 2>/dev/null");
-        run_cmd(ip6t + " -t nat -A VORTEX_OUT6 -m mark --mark " + mark +
-                " -j RETURN 2>/dev/null");
-        run_cmd(ip6t + " -t nat -A VORTEX_OUT6 -d ::1/128 -j RETURN 2>/dev/null");
-        run_cmd(ip6t + " -t nat -A VORTEX_OUT6 -d fc00::/7 -j RETURN 2>/dev/null");
-        run_cmd(ip6t + " -t nat -A VORTEX_OUT6 -d fe80::/10 -j RETURN 2>/dev/null");
-        for (const auto& kv : linux_router::g_cfg.links) {
-            for (const auto& host : kv.second.uplink_hosts()) {
-                in6_addr v6{};
-                if (inet_pton(AF_INET6, strip_ip_brackets(host).c_str(), &v6) != 1) continue;
-                run_cmd(ip6t + " -t nat -A VORTEX_OUT6 -d " + strip_ip_brackets(host) +
-                        " -j RETURN 2>/dev/null");
-            }
-        }
+        run_cmd(ip6t + " -t nat -X VORTEX_OUT6 2>/dev/null");
     }
     // Stand-in range always redirected (collision fake-IP).
     run_cmd(ipt + " -t nat -A VORTEX_OUT -d " + std::string(kStandInCidr) +
@@ -2944,6 +3025,9 @@ bool open_listeners() {
         }
     }
     if (listen(g_tcp_fd, 128) != 0) return false;
+
+    // IPv6 透明监听置空，防止无 TUN 下重定向产生死锁
+    g_tcp6_fd = -1;
     return true;
 }
 
@@ -3097,6 +3181,7 @@ int main(int argc, char** argv) {
 
     std::thread dns_thr(dns_loop);
     std::thread tcp_thr(tcp_accept_loop);
+    std::thread tcp6_thr(tcp6_accept_loop);
     std::thread icmp_thr(icmp_nfq_loop);
 
     auto last_stat = std::chrono::steady_clock::now();
@@ -3128,6 +3213,7 @@ int main(int argc, char** argv) {
     linux_router::stop();
     if (dns_thr.joinable()) dns_thr.join();
     if (tcp_thr.joinable()) tcp_thr.join();
+    if (tcp6_thr.joinable()) tcp6_thr.join();
     if (icmp_thr.joinable()) icmp_thr.join();
     net_cleanup();
     log_line("[*] LinuxNetwork stopped (network restored)");

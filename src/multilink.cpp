@@ -693,17 +693,27 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    socket_t listen_fd = create_listen_socket(
-        cfg.socks5_bind_ip, cfg.socks5_bind_port, cfg.listen_backlog);
-    if (listen_fd == INVALID_SOCK) {
-        std::cerr << "[-] Failed to bind SOCKS5 "
-                  << cfg.socks5_bind_ip << ":" << cfg.socks5_bind_port << "\n";
+    // 【修改点】支持同时绑定多个 socks5_bind_ips
+    std::vector<socket_t> listen_fds;
+    for (const auto& bind_ip : cfg.socks5_bind_ips) {
+        socket_t listen_fd = create_listen_socket(
+            bind_ip, cfg.socks5_bind_port, cfg.listen_backlog);
+        if (listen_fd == INVALID_SOCK) {
+            std::cerr << "[-] Failed to bind SOCKS5 "
+                      << bind_ip << ":" << cfg.socks5_bind_port << "\n";
+            continue;
+        }
+        listen_fds.push_back(listen_fd);
+        std::cout << "[*] MultiLink SOCKS5 on "
+                  << format_host_port(bind_ip, cfg.socks5_bind_port) << std::endl;
+    }
+
+    if (listen_fds.empty()) {
+        std::cerr << "[-] Failed to bind any SOCKS5 address\n";
         net_cleanup();
         return 1;
     }
 
-    std::cout << "[*] MultiLink SOCKS5 on "
-              << format_host_port(cfg.socks5_bind_ip, cfg.socks5_bind_port) << std::endl;
     for (const auto& kv : cfg.links) {
         const auto& L = kv.second;
         std::cout << "[*] Link " << L.name << " -> "
@@ -721,16 +731,36 @@ int main(int argc, char* argv[]) {
               << std::endl;
     std::cout.flush();
 
-    while (g_running) {
-        socket_t local_fd = accept_any(listen_fd);
-        if (local_fd == INVALID_SOCK) {
-            if (!g_running) break;
-            continue;
-        }
-        std::thread(handle_socks5, local_fd, cfg).detach();
+    // 【修改点】为每一个监听 socket 启动一个接受连接的线程
+    std::vector<std::thread> accept_threads;
+    for (socket_t listen_fd : listen_fds) {
+        accept_threads.emplace_back([listen_fd, cfg]() {
+            while (g_running) {
+                socket_t local_fd = accept_any(listen_fd);
+                if (local_fd == INVALID_SOCK) {
+                    if (!g_running) break;
+                    continue;
+                }
+                std::thread(handle_socks5, local_fd, cfg).detach();
+            }
+        });
     }
 
-    net_close(listen_fd);
+    // 主线程等待退出信号
+    while (g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // 清理监听套接字
+    for (socket_t listen_fd : listen_fds) {
+        net_close(listen_fd);
+    }
+
+    // 等待所有 accept 线程退出
+    for (auto& t : accept_threads) {
+        if (t.joinable()) t.join();
+    }
+
     net_cleanup();
     std::cout << "[*] MultiLink stopped\n";
     return 0;
