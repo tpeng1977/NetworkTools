@@ -584,6 +584,11 @@ struct MultilinkConfig {
     // 承接网关 REDIRECT 时用 ["::","0.0.0.0"]；仅本机 divert 可用 ["::1","127.0.0.1"]。
     std::string redirect_bind_ip;
     std::vector<std::string> redirect_bind_ips;
+    // Sticky DNS（与 linux_gate dns_redirect_* 对齐）：multilink 在此地址监听 UDP DNS，
+    // 按规则解析并学习 IP→域名，供 redirect 透明转发做 DOMAIN CONNECT。
+    // dns_redirect_port==0 表示不启 sticky DNS。
+    std::string dns_redirect_host_v4 = "127.0.0.1";
+    int dns_redirect_port = 0;
     int listen_backlog = 128;
 
     std::vector<std::string> redirect_listen_ips() const {
@@ -872,6 +877,11 @@ inline MultilinkConfig MultilinkConfig::load(const std::string& path) {
     if (!c.redirect_bind_ips.empty() || !c.redirect_bind_ip.empty()) {
         finalize_bind_ips(c.redirect_bind_ips, c.redirect_bind_ip);
     }
+    c.dns_redirect_host_v4 =
+        get_string_in(text, "dns_redirect_host_v4", c.dns_redirect_host_v4);
+    normalize_host_ip(c.dns_redirect_host_v4);
+    c.dns_redirect_port = get_int_in(text, "dns_redirect_port", c.dns_redirect_port);
+    if (c.dns_redirect_port < 0 || c.dns_redirect_port > 65535) c.dns_redirect_port = 0;
     c.listen_backlog = get_int_in(text, "listen_backlog", c.listen_backlog);
     c.rules_path = get_string_in(text, "rules_path", c.rules_path);
     c.geoip_cn = get_string_in(text, "geoip_cn", c.geoip_cn);

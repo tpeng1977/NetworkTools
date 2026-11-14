@@ -21,7 +21,7 @@
 //      (reply inject uses IP_HDRINCL / IPv6 raw so from=<echo-request dst>)
 //
 // DIRECT egress: dual-stack DNS-over-TCP (AAAA∥A), Happy-Eyeballs connect race.
-// PROXY DNS: one SOCKS session resolves A+AAAA and caches (~120s) for both QTYPEs.
+// PROXY DNS: sticky A|AAAA each use one Vortex DNS-over-TCP; cache (~120s) merges.
 //
 // Usage:
 //   sudo ./linux_network config/internet.json
@@ -507,6 +507,10 @@ ResolveHostsFn g_resolve_hosts_for_direct = nullptr;
 // ---------------------------------------------------------------------------
 // MultiLink SOCKS5 router (same behavior as multilink.cpp / internet router)
 // ---------------------------------------------------------------------------
+namespace linux_router {
+extern MultilinkConfig g_cfg;
+}
+
 namespace router_detail {
 
 std::atomic<bool> g_running{true};
@@ -1150,6 +1154,65 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
 
     shutdown_both(local_fd);
     shutdown_both(s->remote_fd);
+}
+
+// Sticky / divert PROXY DNS: Vortex CONNECT → DNS-over-TCP directly (no local
+// SOCKS :53 hop). handle_socks5 DNS is one-shot; pipelining A+AAAA on that path
+// used to poison AAAA as NODATA.
+bool proxy_dns_lookup(const std::string& qname, uint16_t qtype, std::vector<uint8_t>& answer) {
+    answer.clear();
+    if (qname.empty() || qname == "?" || (qtype != 1 && qtype != 28)) return false;
+    const auto decision = g_rules.decide(qname, false, 0, /*allow_dns_resolve=*/false);
+    if (decision.action != rules::Action::Proxy) return false;
+    LinkEndpoint link;
+    std::string link_err;
+    if (!select_link(linux_router::g_cfg, decision, link, link_err) || link.name.empty()) {
+        return false;
+    }
+    auto make_resolver = [](uint32_t ip_host) {
+        SocksTarget t;
+        t.atyp = vortex::ATYP_IPV4;
+        t.port = 53;
+        t.has_ipv4 = true;
+        t.ipv4_host = ip_host;
+        const uint32_t ip_net = htonl(ip_host);
+        char buf[INET_ADDRSTRLEN] = {};
+        in_addr a{};
+        a.s_addr = ip_net;
+        inet_ntop(AF_INET, &a, buf, sizeof(buf));
+        t.host = buf;
+        t.wire.clear();
+        t.wire.push_back(vortex::ATYP_IPV4);
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(&ip_net);
+        t.wire.insert(t.wire.end(), raw, raw + 4);
+        t.wire.push_back(0);
+        t.wire.push_back(53);
+        return t;
+    };
+    const auto q = build_dns_query(
+        qname, qtype,
+        static_cast<uint16_t>(std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFF));
+    if (q.empty()) return false;
+    std::vector<uint8_t> framed;
+    framed.push_back(static_cast<uint8_t>((q.size() >> 8) & 0xFF));
+    framed.push_back(static_cast<uint8_t>(q.size() & 0xFF));
+    framed.insert(framed.end(), q.begin(), q.end());
+
+    auto try_resolver = [&](uint32_t ip_host) -> bool {
+        auto s = std::make_shared<Session>();
+        s->link = link;
+        s->idle_timeout_sec = link.idle_timeout_sec > 0 ? link.idle_timeout_sec : 30;
+        SocksTarget t = make_resolver(ip_host);
+        std::vector<uint8_t> out;
+        if (!dns_query_proxy(s, t, framed.data(), framed.size(), out) || out.size() < 2) {
+            return false;
+        }
+        answer.assign(out.begin() + 2, out.end());
+        return !answer.empty();
+    };
+    if (try_resolver(0x08080808u)) return true; // 8.8.8.8
+    if (try_resolver(0x01010101u)) return true; // 1.1.1.1
+    return false;
 }
 
 } // namespace router_detail
@@ -1944,68 +2007,18 @@ socket_t socks5_connect_host(const std::string& host, uint16_t port, int timeout
     return s;
 }
 
-// PROXY DNS cache: one SOCKS handshake answers A+AAAA and serves both QTYPEs.
+// PROXY DNS cache: A/AAAA resolved independently via Vortex (not local SOCKS :53).
 struct SocksDnsCacheEnt {
     uint32_t v4 = 0;
     in6_addr v6{};
     bool has_v4 = false;
     bool has_v6 = false;
-    bool v6_nodata = false;
+    bool v6_nodata = false; // true only after a real DNS NODATA/NXDOMAIN for AAAA
     std::chrono::steady_clock::time_point expire{};
 };
 std::mutex g_socks_dns_mu;
 std::unordered_map<std::string, SocksDnsCacheEnt> g_socks_dns_cache;
 constexpr int kSocksDnsCacheTtlSec = 120;
-
-bool socks5_dns_query_one(socket_t s, uint16_t qtype, const std::string& name,
-                          std::vector<uint8_t>& resp) {
-    resp.clear();
-    const auto q = build_dns_query(
-        name, qtype,
-        static_cast<uint16_t>(std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFF));
-    if (q.empty()) return false;
-    const uint8_t lenb[2] = {static_cast<uint8_t>(q.size() >> 8),
-                             static_cast<uint8_t>(q.size() & 0xFF)};
-    if (!send_all_buf(s, lenb, 2) || !send_all_buf(s, q.data(), q.size())) return false;
-    uint8_t rlenb[2];
-    if (!recvn(s, reinterpret_cast<char*>(rlenb), 2)) return false;
-    const size_t rlen = (static_cast<size_t>(rlenb[0]) << 8) | rlenb[1];
-    if (rlen < 12 || rlen > 4096) return false;
-    resp.resize(rlen);
-    return recvn(s, reinterpret_cast<char*>(resp.data()), static_cast<int>(rlen));
-}
-
-// One SOCKS CONNECT → DNS-over-TCP for both A and AAAA (halves handshake cost).
-bool socks5_dns_resolve_both(const std::string& name, SocksDnsCacheEnt& out, int timeout_sec = 4) {
-    out = SocksDnsCacheEnt{};
-    socket_t s = socks5_connect_host("8.8.8.8", 53, timeout_sec);
-    if (s == INVALID_SOCK) s = socks5_connect_host("1.1.1.1", 53, timeout_sec);
-    if (s == INVALID_SOCK) return false;
-    set_timeouts(s, timeout_sec);
-    std::vector<uint8_t> resp;
-    if (socks5_dns_query_one(s, 1, name, resp)) {
-        uint32_t a = 0;
-        if (parse_dns_a_answer(resp.data(), resp.size(), a) == DnsAResult::Ok && a) {
-            out.v4 = a;
-            out.has_v4 = true;
-        }
-    }
-    if (socks5_dns_query_one(s, 28, name, resp)) {
-        in6_addr a6{};
-        if (parse_dns_aaaa_answer(resp.data(), resp.size(), a6) == DnsAResult::Ok) {
-            out.v6 = a6;
-            out.has_v6 = true;
-        } else {
-            out.v6_nodata = true;
-        }
-    } else {
-        out.v6_nodata = true;
-    }
-    linux_self::unregister_socket(s);
-    net_close(s);
-    out.expire = std::chrono::steady_clock::now() + std::chrono::seconds(kSocksDnsCacheTtlSec);
-    return out.has_v4 || out.has_v6 || out.v6_nodata;
-}
 
 bool socks_dns_cache_get(const std::string& name, SocksDnsCacheEnt& out) {
     const std::string key = to_lower_host(name);
@@ -2020,11 +2033,24 @@ bool socks_dns_cache_get(const std::string& name, SocksDnsCacheEnt& out) {
     return true;
 }
 
-void socks_dns_cache_put(const std::string& name, const SocksDnsCacheEnt& ent) {
+void socks_dns_cache_merge(const std::string& name, const SocksDnsCacheEnt& patch) {
     const std::string key = to_lower_host(name);
     std::lock_guard<std::mutex> lock(g_socks_dns_mu);
     if (g_socks_dns_cache.size() > 8192) g_socks_dns_cache.clear();
-    g_socks_dns_cache[key] = ent;
+    auto& e = g_socks_dns_cache[key];
+    if (patch.has_v4) {
+        e.v4 = patch.v4;
+        e.has_v4 = true;
+    }
+    if (patch.has_v6) {
+        e.v6 = patch.v6;
+        e.has_v6 = true;
+        e.v6_nodata = false;
+    } else if (patch.v6_nodata) {
+        e.v6_nodata = true;
+        e.has_v6 = false;
+    }
+    e.expire = patch.expire;
 }
 
 bool resolve_ipv4_via_socks(const std::string& name, uint32_t& out_net) {
@@ -2034,10 +2060,17 @@ bool resolve_ipv4_via_socks(const std::string& name, uint32_t& out_net) {
         out_net = ent.v4;
         return true;
     }
-    if (!socks5_dns_resolve_both(name, ent)) return false;
-    socks_dns_cache_put(name, ent);
-    if (!ent.has_v4) return false;
-    out_net = ent.v4;
+    // A-only Vortex DoT — do not wait on AAAA (keeps PROXY browse path fast).
+    std::vector<uint8_t> resp;
+    if (!router_detail::proxy_dns_lookup(name, 1, resp)) return false;
+    uint32_t a = 0;
+    if (parse_dns_a_answer(resp.data(), resp.size(), a) != DnsAResult::Ok || !a) return false;
+    SocksDnsCacheEnt patch{};
+    patch.v4 = a;
+    patch.has_v4 = true;
+    patch.expire = std::chrono::steady_clock::now() + std::chrono::seconds(kSocksDnsCacheTtlSec);
+    socks_dns_cache_merge(name, patch);
+    out_net = a;
     return true;
 }
 
@@ -2051,11 +2084,25 @@ bool resolve_ipv6_via_socks(const std::string& name, in6_addr& out) {
         }
         if (ent.v6_nodata) return false;
     }
-    if (!socks5_dns_resolve_both(name, ent)) return false;
-    socks_dns_cache_put(name, ent);
-    if (!ent.has_v6) return false;
-    out = ent.v6;
-    return true;
+    // AAAA via its own Vortex CONNECT (never pipelined after A on local SOCKS).
+    std::vector<uint8_t> resp;
+    if (!router_detail::proxy_dns_lookup(name, 28, resp)) return false; // transport fail ≠ NODATA
+    in6_addr a6{};
+    const DnsAResult r = parse_dns_aaaa_answer(resp.data(), resp.size(), a6);
+    SocksDnsCacheEnt patch{};
+    patch.expire = std::chrono::steady_clock::now() + std::chrono::seconds(kSocksDnsCacheTtlSec);
+    if (r == DnsAResult::Ok) {
+        patch.v6 = a6;
+        patch.has_v6 = true;
+        socks_dns_cache_merge(name, patch);
+        out = a6;
+        return true;
+    }
+    if (r == DnsAResult::NoData) {
+        patch.v6_nodata = true;
+        socks_dns_cache_merge(name, patch);
+    }
+    return false;
 }
 
 bool is_doh_host(const std::string& host) {
@@ -3472,7 +3519,7 @@ int main(int argc, char** argv) {
     log_line("[*] self-exclude: SO_MARK " + mark_hex() + " + registered sports + Vortex server IPs");
     log_line("[*] apps: no proxy settings; DNS sticky map; TCP CONNECT(domain) via rules");
     log_line("[*] ICMP/ICMPv6: NFQUEUE → DIRECT accept / PROXY CMD_ICMP with IP literal + inject");
-    log_line("[*] DNS: DIRECT=uplink; PROXY=SOCKS DoT A+AAAA; gai IPv4-prefer → ping=v4 ping6=v6; FILTER6");
+    log_line("[*] DNS: DIRECT=uplink; PROXY=Vortex DoT A|AAAA (no local SOCKS :53); gai IPv4-prefer; FILTER6");
     log_line("[*] unlearned TCP: never redirected (WinDivert reinject)");
     log_line("[*] Ctrl+C restores iptables/DNS immediately; if stuck: sudo ./scripts/restore-network.sh");
 

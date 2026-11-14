@@ -47,14 +47,21 @@ void log_line(const std::string& s) {
 }
 
 // IP -> domain learned from DNS answers, so a later TCP connect by IP still
-// matches DOMAIN / GEOSITE rules.
+// matches DOMAIN / GEOSITE rules (SOCKS DNS-over-TCP + sticky UDP DNS).
 std::mutex g_name_mu;
 std::unordered_map<uint32_t, std::pair<std::string, std::chrono::steady_clock::time_point>> g_ip_name;
+std::unordered_map<std::string, std::pair<std::string, std::chrono::steady_clock::time_point>> g_ip6_name;
 
 void remember_ip_name(uint32_t ip_host, const std::string& name) {
     if (name.empty()) return;
     std::lock_guard<std::mutex> lock(g_name_mu);
     g_ip_name[ip_host] = {name, std::chrono::steady_clock::now()};
+}
+
+void remember_ip6_name(const std::string& ip6, const std::string& name) {
+    if (name.empty() || ip6.empty()) return;
+    std::lock_guard<std::mutex> lock(g_name_mu);
+    g_ip6_name[ip6] = {name, std::chrono::steady_clock::now()};
 }
 
 std::string cached_name(uint32_t ip_host) {
@@ -63,6 +70,18 @@ std::string cached_name(uint32_t ip_host) {
     if (it == g_ip_name.end()) return {};
     if (std::chrono::steady_clock::now() - it->second.second > std::chrono::minutes(10)) {
         g_ip_name.erase(it);
+        return {};
+    }
+    return it->second.first;
+}
+
+std::string cached_name6(const std::string& ip6) {
+    if (ip6.empty()) return {};
+    std::lock_guard<std::mutex> lock(g_name_mu);
+    auto it = g_ip6_name.find(ip6);
+    if (it == g_ip6_name.end()) return {};
+    if (std::chrono::steady_clock::now() - it->second.second > std::chrono::minutes(10)) {
+        g_ip6_name.erase(it);
         return {};
     }
     return it->second.first;
@@ -128,11 +147,16 @@ void remember_dns_answers(const uint8_t* msg, size_t len, const std::string& qna
         const int rdlen = (msg[off + 8] << 8) | msg[off + 9];
         off += 10;
         if (off + static_cast<size_t>(rdlen) > len) return;
-        // Learn A only for IPv4→name map used by later CONNECT rules.
+        // Learn A/AAAA so redirect TCP by real IP can still DOMAIN CONNECT.
         if (typ == 1 && rdlen == 4) {
             uint32_t net = 0;
             std::memcpy(&net, msg + off, 4);
             remember_ip_name(ntohl(net), qname);
+        } else if (typ == 28 && rdlen == 16) {
+            char buf[INET6_ADDRSTRLEN] = {};
+            if (inet_ntop(AF_INET6, msg + off, buf, sizeof(buf))) {
+                remember_ip6_name(buf, qname);
+            }
         }
         off += static_cast<size_t>(rdlen);
     }
@@ -657,6 +681,9 @@ void serve_stream_target(socket_t local_fd, MultilinkConfig cfg, SocksTarget tar
             has_ip = true;
             ip_host = target.ipv4_host;
         }
+    } else if (target.atyp == vortex::ATYP_IPV6) {
+        const std::string learned = cached_name6(target.host);
+        if (!learned.empty()) rule_host = learned;
     }
     const auto decision = g_rules.decide(rule_host, has_ip, ip_host, /*allow_dns_resolve=*/false);
 
@@ -759,6 +786,83 @@ void handle_redirect(socket_t local_fd, MultilinkConfig cfg, bool is_v6) {
         return;
     }
     serve_stream_target(local_fd, std::move(cfg), std::move(target), /*socks_reply=*/false);
+}
+
+// Sticky UDP DNS (linux_gate dns_redirect_*): real A/AAAA + learn IP→name for redirect.
+bool resolve_sticky_dns(const MultilinkConfig& cfg, const uint8_t* query, size_t qlen,
+                        std::vector<uint8_t>& answer) {
+    answer.clear();
+    if (qlen < 12 || qlen > 4096) return false;
+    const std::string name = dns_qname(query, qlen);
+    const uint16_t qtype = dns_qtype(query, qlen);
+    const auto decision =
+        g_rules.decide(name.empty() ? "?" : name, false, 0, /*allow_dns_resolve=*/false);
+
+    LinkEndpoint link;
+    std::string link_err;
+    if (!select_link(cfg, decision, link, link_err)) {
+        if (cfg.log_decisions) {
+            log_line(std::string("[-] sticky DNS ") + link_err + " for " +
+                     (name.empty() ? "?" : name));
+        }
+        return false;
+    }
+
+    if (cfg.log_decisions) {
+        log_line(std::string("[*] sticky DNS ") + rules::decision_name(decision) + " " +
+                 (name.empty() ? "?" : name) + " " + dns_qtype_name(qtype) +
+                 "  (" + decision.matched + ")" +
+                 (link.name.empty() ? "" : " via " + link.name));
+    }
+
+    if (decision.action == rules::Action::Direct) {
+        if (!dns_query_direct(query, qlen, answer)) return false;
+        remember_dns_answers(answer.data(), answer.size(), name);
+        return true;
+    }
+
+    auto s = std::make_shared<Session>();
+    s->link = link;
+    s->idle_timeout_sec = link.idle_timeout_sec > 0 ? link.idle_timeout_sec : 300;
+    // PROXY: DNS-over-TCP to 8.8.8.8 via Vortex (same path as SOCKS :53).
+    SocksTarget t = make_target_ipv4(htonl(0x08080808u), 53);
+    std::vector<uint8_t> framed;
+    framed.push_back(static_cast<uint8_t>((qlen >> 8) & 0xFF));
+    framed.push_back(static_cast<uint8_t>(qlen & 0xFF));
+    framed.insert(framed.end(), query, query + qlen);
+    std::vector<uint8_t> out;
+    if (!dns_query_proxy(s, t, framed.data(), framed.size(), out) || out.size() < 2) {
+        return false;
+    }
+    answer.assign(out.begin() + 2, out.end());
+    remember_dns_answers(answer.data(), answer.size(), name);
+    return true;
+}
+
+void sticky_dns_loop(socket_t dns_fd, MultilinkConfig cfg) {
+    uint8_t buf[2048];
+    while (g_running) {
+        sockaddr_storage peer{};
+        socklen_t plen = sizeof(peer);
+        const int n = static_cast<int>(
+            recvfrom(dns_fd, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+                     reinterpret_cast<sockaddr*>(&peer), &plen));
+        if (n < 0) {
+            if (!g_running) break;
+            continue;
+        }
+        if (n < 12) continue;
+        std::vector<uint8_t> query(buf, buf + n);
+        std::thread([dns_fd, cfg, query, peer, plen]() {
+            std::vector<uint8_t> answer;
+            if (!resolve_sticky_dns(cfg, query.data(), query.size(), answer) || answer.empty()) {
+                return;
+            }
+            sendto(dns_fd, reinterpret_cast<const char*>(answer.data()),
+                   static_cast<int>(answer.size()), 0,
+                   reinterpret_cast<const sockaddr*>(&peer), plen);
+        }).detach();
+    }
 }
 
 bool listen_is_ipv6(socket_t fd) {
@@ -873,6 +977,22 @@ int main(int argc, char* argv[]) {
                   << "); skip redirect listeners\n";
     }
 
+    // Sticky DNS UDP：供 linux_gate DNAT UDP/53 → dns_redirect_host_v4:port。
+    socket_t sticky_dns_fd = INVALID_SOCK;
+    if (cfg.dns_redirect_port > 0) {
+        sticky_dns_fd =
+            create_udp_listen_socket(cfg.dns_redirect_host_v4, cfg.dns_redirect_port);
+        if (sticky_dns_fd == INVALID_SOCK) {
+            std::cerr << "[-] Failed to bind sticky DNS "
+                      << format_host_port(cfg.dns_redirect_host_v4, cfg.dns_redirect_port)
+                      << "\n";
+        } else {
+            std::cout << "[*] MultiLink sticky DNS on "
+                      << format_host_port(cfg.dns_redirect_host_v4, cfg.dns_redirect_port)
+                      << " (UDP; learn A/AAAA for redirect DOMAIN CONNECT)" << std::endl;
+        }
+    }
+
     for (const auto& kv : cfg.links) {
         const auto& L = kv.second;
         std::cout << "[*] Link " << L.name << " -> "
@@ -917,6 +1037,9 @@ int main(int argc, char* argv[]) {
             }
         });
     }
+    if (sticky_dns_fd != INVALID_SOCK) {
+        accept_threads.emplace_back(sticky_dns_loop, sticky_dns_fd, cfg);
+    }
 
     // 主线程等待退出信号
     while (g_running) {
@@ -929,6 +1052,9 @@ int main(int argc, char* argv[]) {
     }
     for (socket_t listen_fd : redirect_fds) {
         net_close(listen_fd);
+    }
+    if (sticky_dns_fd != INVALID_SOCK) {
+        net_close(sticky_dns_fd);
     }
 
     // 等待所有 accept 线程退出
