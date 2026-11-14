@@ -366,27 +366,34 @@ inline socket_t tcp_connect(const std::string& host, int port, int idle_timeout_
         return INVALID_SOCK;
     }
 
-    // Cap per-address connect wait so dual-stack host lists fail over quickly.
-    int connect_timeout = idle_timeout_sec > 0 ? idle_timeout_sec : 5;
-    if (connect_timeout > 5) connect_timeout = 5;
+    // Cap per-address connect wait — keep short so dual-stack fails over fast.
+    int connect_timeout = idle_timeout_sec > 0 ? idle_timeout_sec : 2;
+    if (connect_timeout > 2) connect_timeout = 2;
     if (connect_timeout < 1) connect_timeout = 1;
 
-    // Prefer IPv6 results first (stable within each family), then IPv4.
+    // Happy Eyeballs spirit: try first AAAA briefly, then race/fall to A quickly.
+    addrinfo* first6 = nullptr;
+    addrinfo* first4 = nullptr;
+    std::vector<addrinfo*> rest;
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        if (p->ai_family == AF_INET6 && !first6) first6 = p;
+        else if (p->ai_family == AF_INET && !first4) first4 = p;
+        else rest.push_back(p);
+    }
     std::vector<addrinfo*> ordered;
-    for (addrinfo* p = res; p; p = p->ai_next) {
-        if (p->ai_family == AF_INET6) ordered.push_back(p);
-    }
-    for (addrinfo* p = res; p; p = p->ai_next) {
-        if (p->ai_family != AF_INET6) ordered.push_back(p);
-    }
+    if (first6) ordered.push_back(first6);
+    if (first4) ordered.push_back(first4);
+    ordered.insert(ordered.end(), rest.begin(), rest.end());
 
     socket_t fd = INVALID_SOCK;
-    for (addrinfo* p : ordered) {
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        addrinfo* p = ordered[i];
+        // First address (often v6): short probe; later addresses get full budget.
+        const int to = (i == 0 && ordered.size() > 1) ? 1 : connect_timeout;
         fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd == INVALID_SOCK) continue;
         set_socket_options(fd, idle_timeout_sec);
-        if (connect_with_timeout(fd, p->ai_addr, static_cast<socklen_type>(p->ai_addrlen),
-                                 connect_timeout)) {
+        if (connect_with_timeout(fd, p->ai_addr, static_cast<socklen_type>(p->ai_addrlen), to)) {
             break;
         }
         net_close(fd);

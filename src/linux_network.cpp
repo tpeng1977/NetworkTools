@@ -20,8 +20,8 @@
 //   6) ICMP/ICMPv6 echo-request NFQUEUE → rules; DIRECT=ACCEPT, else Vortex CMD_ICMP + inject
 //      (reply inject uses IP_HDRINCL / IPv6 raw so from=<echo-request dst>)
 //
-// DIRECT egress (SOCKS + transparent→SOCKS domain): dual-stack DNS-over-TCP
-// (AAAA then A), IPv6-prefer connect with IPv4 fallback — aligned with multilink.
+// DIRECT egress: dual-stack DNS-over-TCP (AAAA∥A), Happy-Eyeballs connect race.
+// PROXY DNS: one SOCKS session resolves A+AAAA and caches (~120s) for both QTYPEs.
 //
 // Usage:
 //   sudo ./linux_network config/internet.json
@@ -59,6 +59,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -146,7 +147,51 @@ inline bool is_uplink_ipv6(const in6_addr& a) {
     return g_uplink_v6.count(std::string(reinterpret_cast<const char*>(&a), 16)) != 0;
 }
 
-// internet.cpp tcp_connect_registered: bind → register → connect. Plus SO_MARK.
+// Prepare a marked non-blocking socket bound for connect (IPv4 or IPv6).
+inline socket_t make_marked_nb_socket(int family, int idle_timeout_sec) {
+    socket_t fd = ::socket(family, SOCK_STREAM, IPPROTO_TCP);
+    if (fd == INVALID_SOCK) return INVALID_SOCK;
+    set_mark(fd);
+    set_socket_options(fd, idle_timeout_sec);
+    if (family == AF_INET6) {
+        sockaddr_in6 local6{};
+        local6.sin6_family = AF_INET6;
+        local6.sin6_addr = in6addr_any;
+        if (::bind(fd, reinterpret_cast<sockaddr*>(&local6), sizeof(local6)) != 0) {
+            net_close(fd);
+            return INVALID_SOCK;
+        }
+    } else {
+        sockaddr_in local{};
+        local.sin_family = AF_INET;
+        local.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (::bind(fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+            net_close(fd);
+            return INVALID_SOCK;
+        }
+    }
+    if (!set_nonblock(fd, true)) {
+        net_close(fd);
+        return INVALID_SOCK;
+    }
+    return fd;
+}
+
+inline bool connect_nb_start(socket_t fd, const sockaddr* addr, socklen_type len) {
+    const int rc = ::connect(fd, addr, len);
+    if (rc == 0) return true;
+    return errno == EINPROGRESS;
+}
+
+inline bool connect_nb_ready(socket_t fd) {
+    int soerr = 0;
+    socklen_type slen = sizeof(soerr);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0 || soerr != 0) return false;
+    set_nonblock(fd, false);
+    return true;
+}
+
+// Happy Eyeballs-ish: race first IPv6 + first IPv4 (250ms stagger), then remaining.
 inline socket_t tcp_connect_registered(const std::string& host, int port, int idle_timeout_sec) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
@@ -157,48 +202,102 @@ inline socket_t tcp_connect_registered(const std::string& host, int port, int id
     if (getaddrinfo(host_norm.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
         return INVALID_SOCK;
     }
-    std::vector<addrinfo*> ordered;
+    addrinfo* first6 = nullptr;
+    addrinfo* first4 = nullptr;
+    std::vector<addrinfo*> rest;
     for (addrinfo* p = res; p; p = p->ai_next) {
-        if (p->ai_family == AF_INET6) ordered.push_back(p);
+        if (p->ai_family == AF_INET6 && !first6) first6 = p;
+        else if (p->ai_family == AF_INET && !first4) first4 = p;
+        else rest.push_back(p);
     }
-    for (addrinfo* p = res; p; p = p->ai_next) {
-        if (p->ai_family != AF_INET6) ordered.push_back(p);
-    }
-    socket_t fd = INVALID_SOCK;
-    for (addrinfo* p : ordered) {
-        fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd == INVALID_SOCK) continue;
-        set_mark(fd);
-        set_socket_options(fd, idle_timeout_sec);
-        if (p->ai_family == AF_INET6) {
-            sockaddr_in6 local6{};
-            local6.sin6_family = AF_INET6;
-            local6.sin6_addr = in6addr_any;
-            local6.sin6_port = 0;
-            if (::bind(fd, reinterpret_cast<sockaddr*>(&local6), sizeof(local6)) != 0) {
-                net_close(fd);
-                fd = INVALID_SOCK;
-                continue;
+
+    auto finish_ok = [&](socket_t fd) {
+        register_socket(fd);
+        freeaddrinfo(res);
+        return fd;
+    };
+
+    // Parallel race when both families exist.
+    if (first6 && first4) {
+        socket_t s6 = make_marked_nb_socket(AF_INET6, idle_timeout_sec);
+        socket_t s4 = INVALID_SOCK;
+        bool started4 = false;
+        if (s6 != INVALID_SOCK &&
+            !connect_nb_start(s6, first6->ai_addr, static_cast<socklen_type>(first6->ai_addrlen))) {
+            net_close(s6);
+            s6 = INVALID_SOCK;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(1500)) {
+            if (!started4 &&
+                std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(250)) {
+                s4 = make_marked_nb_socket(AF_INET, idle_timeout_sec);
+                if (s4 != INVALID_SOCK &&
+                    !connect_nb_start(s4, first4->ai_addr,
+                                      static_cast<socklen_type>(first4->ai_addrlen))) {
+                    net_close(s4);
+                    s4 = INVALID_SOCK;
+                }
+                started4 = true;
             }
-        } else {
-            sockaddr_in local{};
-            local.sin_family = AF_INET;
-            local.sin_addr.s_addr = htonl(INADDR_ANY);
-            local.sin_port = 0;
-            if (::bind(fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
-                net_close(fd);
-                fd = INVALID_SOCK;
-                continue;
+            fd_set wset;
+            FD_ZERO(&wset);
+            int maxfd = -1;
+            if (s6 != INVALID_SOCK) {
+                FD_SET(s6, &wset);
+                maxfd = std::max(maxfd, static_cast<int>(s6));
+            }
+            if (s4 != INVALID_SOCK) {
+                FD_SET(s4, &wset);
+                maxfd = std::max(maxfd, static_cast<int>(s4));
+            }
+            if (maxfd < 0) break;
+            timeval tv{};
+            tv.tv_usec = 50000;
+            const int sel = ::select(maxfd + 1, nullptr, &wset, nullptr, &tv);
+            if (sel > 0) {
+                // Prefer whichever became writable; if both, prefer the one that
+                // connected (v4 often wins on CN links — still dual-stack capable).
+                if (s4 != INVALID_SOCK && FD_ISSET(s4, &wset) && connect_nb_ready(s4)) {
+                    if (s6 != INVALID_SOCK) net_close(s6);
+                    return finish_ok(s4);
+                }
+                if (s6 != INVALID_SOCK && FD_ISSET(s6, &wset) && connect_nb_ready(s6)) {
+                    if (s4 != INVALID_SOCK) net_close(s4);
+                    return finish_ok(s6);
+                }
+                if (s4 != INVALID_SOCK && FD_ISSET(s4, &wset)) {
+                    net_close(s4);
+                    s4 = INVALID_SOCK;
+                }
+                if (s6 != INVALID_SOCK && FD_ISSET(s6, &wset)) {
+                    net_close(s6);
+                    s6 = INVALID_SOCK;
+                }
             }
         }
-        register_socket(fd);
-        if (::connect(fd, p->ai_addr, static_cast<socklen_type>(p->ai_addrlen)) == 0) break;
-        unregister_socket(fd);
+        if (s6 != INVALID_SOCK) net_close(s6);
+        if (s4 != INVALID_SOCK) net_close(s4);
+    }
+
+    std::vector<addrinfo*> ordered;
+    if (first6) ordered.push_back(first6);
+    if (first4) ordered.push_back(first4);
+    ordered.insert(ordered.end(), rest.begin(), rest.end());
+    int per = idle_timeout_sec > 0 ? idle_timeout_sec : 3;
+    if (per > 2) per = 2;
+    if (per < 1) per = 1;
+    for (addrinfo* p : ordered) {
+        socket_t fd = make_marked_nb_socket(p->ai_family, idle_timeout_sec);
+        if (fd == INVALID_SOCK) continue;
+        set_nonblock(fd, false);
+        if (connect_with_timeout(fd, p->ai_addr, static_cast<socklen_type>(p->ai_addrlen), per)) {
+            return finish_ok(fd);
+        }
         net_close(fd);
-        fd = INVALID_SOCK;
     }
     freeaddrinfo(res);
-    return fd;
+    return INVALID_SOCK;
 }
 
 inline socket_t tcp_connect_marked(const std::string& host, int port, int idle_timeout_sec) {
@@ -214,8 +313,53 @@ inline socket_t tcp_connect_marked_hosts(const std::vector<std::string>& hosts, 
         detail->used_host.clear();
         detail->failed_hosts.clear();
     }
+    // Race first v6 literal with first v4 literal when both present.
+    std::string h6, h4;
+    std::vector<std::string> rest;
     for (const auto& h : hosts) {
         if (h.empty()) continue;
+        if (h6.empty() && host_is_ipv6_literal(h)) h6 = h;
+        else if (h4.empty() && host_is_ipv4_literal(h)) h4 = h;
+        else rest.push_back(h);
+    }
+    if (!h6.empty() && !h4.empty()) {
+        std::atomic<socket_t> winner{INVALID_SOCK};
+        std::atomic<int> done{0};
+        std::string used;
+        std::mutex used_mu;
+        auto worker = [&](const std::string& h) {
+            socket_t fd = tcp_connect_marked(h, port, idle_timeout_sec);
+            if (fd != INVALID_SOCK) {
+                socket_t expected = INVALID_SOCK;
+                if (winner.compare_exchange_strong(expected, fd)) {
+                    std::lock_guard<std::mutex> lock(used_mu);
+                    used = h;
+                } else {
+                    unregister_socket(fd);
+                    net_close(fd);
+                }
+            } else if (detail) {
+                std::lock_guard<std::mutex> lock(used_mu);
+                detail->failed_hosts.push_back(h);
+            }
+            ++done;
+        };
+        std::thread t6(worker, h6);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::thread t4(worker, h4);
+        t6.join();
+        t4.join();
+        socket_t w = winner.load();
+        if (w != INVALID_SOCK) {
+            if (detail) detail->used_host = used;
+            return w;
+        }
+    } else if (!h6.empty()) {
+        rest.insert(rest.begin(), h6);
+    } else if (!h4.empty()) {
+        rest.insert(rest.begin(), h4);
+    }
+    for (const auto& h : rest) {
         socket_t fd = tcp_connect_marked(h, port, idle_timeout_sec);
         if (fd != INVALID_SOCK) {
             if (detail) detail->used_host = h;
@@ -281,14 +425,24 @@ inline bool resolve_hosts_dns_tcp_marked(const std::string& name,
     auto try_resolver = [&](const char* r) -> bool {
         if (!r || !*r) return false;
         std::vector<std::string> v6, v4;
-        for (uint16_t qtype : {static_cast<uint16_t>(28), static_cast<uint16_t>(1)}) {
+        // Parallel AAAA + A over two marked TCP sessions (cut serial RTT).
+        std::mutex ans_mu;
+        auto one = [&](uint16_t qtype) {
             const auto q = build_dns_query(name, qtype);
-            if (q.empty()) continue;
+            if (q.empty()) return;
             std::vector<uint8_t> resp;
             if (!dns_tcp_transact_marked(r, resolver_port, q.data(), q.size(), resp, timeout_sec))
-                continue;
-            dns_collect_answer_hosts(resp.data(), resp.size(), v6, v4);
-        }
+                return;
+            std::vector<std::string> a6, a4;
+            dns_collect_answer_hosts(resp.data(), resp.size(), a6, a4);
+            std::lock_guard<std::mutex> lock(ans_mu);
+            v6.insert(v6.end(), a6.begin(), a6.end());
+            v4.insert(v4.end(), a4.begin(), a4.end());
+        };
+        std::thread t6(one, static_cast<uint16_t>(28));
+        std::thread t4(one, static_cast<uint16_t>(1));
+        t6.join();
+        t4.join();
         for (const auto& h : v6) {
             if (std::find(out_hosts.begin(), out_hosts.end(), h) == out_hosts.end())
                 out_hosts.push_back(h);
@@ -1315,9 +1469,12 @@ void dns_bind_name6(const std::string& qname_raw, const in6_addr& addr) {
     if (qname.empty() || qname == "?") return;
     const std::string key = ip6_to_string(addr);
     if (key.empty() || key == "?") return;
-    std::lock_guard<std::mutex> lock(g_dns_mu);
-    g_ip6_to_name[key] = qname;
-    g_name_to_ip6[qname] = addr;
+    {
+        std::lock_guard<std::mutex> lock(g_dns_mu);
+        g_ip6_to_name[key] = qname;
+        g_name_to_ip6[qname] = addr;
+    }
+    // iptables outside DNS lock — avoid blocking other resolvers on system().
     ipt_learn_add6(key);
 }
 
@@ -1787,62 +1944,118 @@ socket_t socks5_connect_host(const std::string& host, uint16_t port, int timeout
     return s;
 }
 
-// DNS-over-TCP via in-process SOCKS → public resolver (PROXY answers must not
-// use poisoned uplink UDP: google A=185.45.5.35 / AAAA=2001::1).
-bool socks5_dns_tcp_transact(uint16_t qtype, const std::string& name,
-                             std::vector<uint8_t>& resp, int timeout_sec = 8) {
+// PROXY DNS cache: one SOCKS handshake answers A+AAAA and serves both QTYPEs.
+struct SocksDnsCacheEnt {
+    uint32_t v4 = 0;
+    in6_addr v6{};
+    bool has_v4 = false;
+    bool has_v6 = false;
+    bool v6_nodata = false;
+    std::chrono::steady_clock::time_point expire{};
+};
+std::mutex g_socks_dns_mu;
+std::unordered_map<std::string, SocksDnsCacheEnt> g_socks_dns_cache;
+constexpr int kSocksDnsCacheTtlSec = 120;
+
+bool socks5_dns_query_one(socket_t s, uint16_t qtype, const std::string& name,
+                          std::vector<uint8_t>& resp) {
     resp.clear();
     const auto q = build_dns_query(
         name, qtype,
         static_cast<uint16_t>(std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFF));
     if (q.empty()) return false;
+    const uint8_t lenb[2] = {static_cast<uint8_t>(q.size() >> 8),
+                             static_cast<uint8_t>(q.size() & 0xFF)};
+    if (!send_all_buf(s, lenb, 2) || !send_all_buf(s, q.data(), q.size())) return false;
+    uint8_t rlenb[2];
+    if (!recvn(s, reinterpret_cast<char*>(rlenb), 2)) return false;
+    const size_t rlen = (static_cast<size_t>(rlenb[0]) << 8) | rlenb[1];
+    if (rlen < 12 || rlen > 4096) return false;
+    resp.resize(rlen);
+    return recvn(s, reinterpret_cast<char*>(resp.data()), static_cast<int>(rlen));
+}
+
+// One SOCKS CONNECT → DNS-over-TCP for both A and AAAA (halves handshake cost).
+bool socks5_dns_resolve_both(const std::string& name, SocksDnsCacheEnt& out, int timeout_sec = 4) {
+    out = SocksDnsCacheEnt{};
     socket_t s = socks5_connect_host("8.8.8.8", 53, timeout_sec);
     if (s == INVALID_SOCK) s = socks5_connect_host("1.1.1.1", 53, timeout_sec);
     if (s == INVALID_SOCK) return false;
     set_timeouts(s, timeout_sec);
-    const uint8_t lenb[2] = {static_cast<uint8_t>(q.size() >> 8),
-                             static_cast<uint8_t>(q.size() & 0xFF)};
-    if (!send_all_buf(s, lenb, 2) || !send_all_buf(s, q.data(), q.size())) {
-        linux_self::unregister_socket(s);
-        net_close(s);
-        return false;
+    std::vector<uint8_t> resp;
+    if (socks5_dns_query_one(s, 1, name, resp)) {
+        uint32_t a = 0;
+        if (parse_dns_a_answer(resp.data(), resp.size(), a) == DnsAResult::Ok && a) {
+            out.v4 = a;
+            out.has_v4 = true;
+        }
     }
-    uint8_t rlenb[2];
-    if (!recvn(s, reinterpret_cast<char*>(rlenb), 2)) {
-        linux_self::unregister_socket(s);
-        net_close(s);
-        return false;
-    }
-    const size_t rlen = (static_cast<size_t>(rlenb[0]) << 8) | rlenb[1];
-    if (rlen < 12 || rlen > 4096) {
-        linux_self::unregister_socket(s);
-        net_close(s);
-        return false;
-    }
-    resp.resize(rlen);
-    if (!recvn(s, reinterpret_cast<char*>(resp.data()), static_cast<int>(rlen))) {
-        linux_self::unregister_socket(s);
-        net_close(s);
-        resp.clear();
-        return false;
+    if (socks5_dns_query_one(s, 28, name, resp)) {
+        in6_addr a6{};
+        if (parse_dns_aaaa_answer(resp.data(), resp.size(), a6) == DnsAResult::Ok) {
+            out.v6 = a6;
+            out.has_v6 = true;
+        } else {
+            out.v6_nodata = true;
+        }
+    } else {
+        out.v6_nodata = true;
     }
     linux_self::unregister_socket(s);
     net_close(s);
+    out.expire = std::chrono::steady_clock::now() + std::chrono::seconds(kSocksDnsCacheTtlSec);
+    return out.has_v4 || out.has_v6 || out.v6_nodata;
+}
+
+bool socks_dns_cache_get(const std::string& name, SocksDnsCacheEnt& out) {
+    const std::string key = to_lower_host(name);
+    std::lock_guard<std::mutex> lock(g_socks_dns_mu);
+    auto it = g_socks_dns_cache.find(key);
+    if (it == g_socks_dns_cache.end()) return false;
+    if (std::chrono::steady_clock::now() >= it->second.expire) {
+        g_socks_dns_cache.erase(it);
+        return false;
+    }
+    out = it->second;
     return true;
+}
+
+void socks_dns_cache_put(const std::string& name, const SocksDnsCacheEnt& ent) {
+    const std::string key = to_lower_host(name);
+    std::lock_guard<std::mutex> lock(g_socks_dns_mu);
+    if (g_socks_dns_cache.size() > 8192) g_socks_dns_cache.clear();
+    g_socks_dns_cache[key] = ent;
 }
 
 bool resolve_ipv4_via_socks(const std::string& name, uint32_t& out_net) {
     out_net = 0;
-    std::vector<uint8_t> resp;
-    if (!socks5_dns_tcp_transact(1, name, resp)) return false;
-    return parse_dns_a_answer(resp.data(), resp.size(), out_net) == DnsAResult::Ok;
+    SocksDnsCacheEnt ent;
+    if (socks_dns_cache_get(name, ent) && ent.has_v4) {
+        out_net = ent.v4;
+        return true;
+    }
+    if (!socks5_dns_resolve_both(name, ent)) return false;
+    socks_dns_cache_put(name, ent);
+    if (!ent.has_v4) return false;
+    out_net = ent.v4;
+    return true;
 }
 
 bool resolve_ipv6_via_socks(const std::string& name, in6_addr& out) {
     std::memset(&out, 0, sizeof(out));
-    std::vector<uint8_t> resp;
-    if (!socks5_dns_tcp_transact(28, name, resp)) return false;
-    return parse_dns_aaaa_answer(resp.data(), resp.size(), out) == DnsAResult::Ok;
+    SocksDnsCacheEnt ent;
+    if (socks_dns_cache_get(name, ent)) {
+        if (ent.has_v6) {
+            out = ent.v6;
+            return true;
+        }
+        if (ent.v6_nodata) return false;
+    }
+    if (!socks5_dns_resolve_both(name, ent)) return false;
+    socks_dns_cache_put(name, ent);
+    if (!ent.has_v6) return false;
+    out = ent.v6;
+    return true;
 }
 
 bool is_doh_host(const std::string& host) {
