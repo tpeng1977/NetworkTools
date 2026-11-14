@@ -45,6 +45,12 @@ if [[ -x "$IP6T" ]]; then
   done
   "$IP6T" -t nat -F VORTEX_OUT6 2>/dev/null || true
   "$IP6T" -t nat -X VORTEX_OUT6 2>/dev/null || true
+  "$IP6T" -t nat -F VORTEX_TCP6 2>/dev/null || true
+  "$IP6T" -t nat -X VORTEX_TCP6 2>/dev/null || true
+  ip -6 addr del fd00:766f:7274::1/128 dev lo 2>/dev/null || true
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table ip6 vortex6 2>/dev/null || true
+  fi
   for _ in 1 2 3 4 5; do
     "$IP6T" -t mangle -D OUTPUT -j VORTEX_ICMP6 2>/dev/null || break
   done

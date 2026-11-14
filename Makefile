@@ -27,19 +27,21 @@ else
   NULL := /dev/null
 endif
 
-.PHONY: all clean test help dist-linux
+.PHONY: all clean test help dist-linux dist-linux-gate linux_gate linux_gate-bin
 
 all: server$(EXE) client$(EXE) smartlink$(EXE) multilink$(EXE) local$(EXE) peer$(EXE)
 ifeq ($(OS),Windows_NT)
 all: ap2socks5.exe activate_net.exe enable_net.exe
 else ifeq ($(UNAME_S),Linux)
-all: linux_network
+all: linux_network linux_gate
 endif
 
 help:
-	@echo "Targets: all, test, clean, dist-linux"
+	@echo "Targets: all, test, clean, dist-linux, dist-linux-gate"
 	@echo "CXX=$(CXX)  OS=$(OS)  UNAME=$(UNAME_S)"
-	@echo "  dist-linux  → dist/VortexInternetLinux/ (relocatable service package)"
+	@echo "  dist-linux       → dist/VortexInternetLinux/"
+	@echo "  dist-linux-gate  → dist/linux_gate/"
+	@echo "  linux_gate       → build + pack dist/linux_gate/"
 	@echo "Portable Ubuntu 22.04 / glibc≤2.35 binaries: ./build-portable.sh"
 
 server$(EXE): src/server.cpp include/config.hpp include/net.hpp include/protocol.hpp include/vortex_cipher.hpp
@@ -63,6 +65,15 @@ peer$(EXE): src/peer.cpp include/config.hpp include/net.hpp include/protocol.hpp
 ifeq ($(UNAME_S),Linux)
 linux_network: src/linux_network.cpp include/config.hpp include/net.hpp include/protocol.hpp include/vortex_cipher.hpp include/rules.hpp
 	$(CXX) $(CXXFLAGS) src/linux_network.cpp -o $@ $(LDFLAGS)
+
+linux_gate-bin: src/linux_gate.cpp include/config.hpp include/net.hpp
+	$(CXX) $(CXXFLAGS) src/linux_gate.cpp -o linux_gate $(LDFLAGS)
+
+# Build binary and pack relocatable dist/linux_gate/
+linux_gate: linux_gate-bin
+	bash scripts/pack-linux-gate.sh
+
+dist-linux-gate: linux_gate
 
 # Relocatable systemd package under dist/VortexInternetLinux/
 dist-linux: linux_network
@@ -102,7 +113,7 @@ clean:
 ifeq ($(OS),Windows_NT)
 	-@$(RM) server.exe client.exe smartlink.exe multilink.exe local.exe peer.exe ap2socks5.exe activate_net.exe enable_net.exe tests\test_core.exe tests\test_rules.exe tests\test_multilink.exe 2>$(NULL)
 else
-	$(RM) server client smartlink multilink local peer linux_network tests/test_core tests/test_rules tests/test_multilink
+	$(RM) server client smartlink multilink local peer linux_network linux_gate tests/test_core tests/test_rules tests/test_multilink
 	$(RM) tests/echo_server tests/socks5_http_get tests/probe_test
 	$(RM) tests/wrong_secret_test tests/binary_echo_test tests/stress_test
 endif

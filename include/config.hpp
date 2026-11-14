@@ -577,9 +577,21 @@ struct PeerConfig {
 
 struct MultilinkConfig {
     std::string socks5_bind_ip = "127.0.0.1";
-    std::vector<std::string> socks5_bind_ips; // 新增：支持多个绑定地址
+    std::vector<std::string> socks5_bind_ips; // 支持 string 或 string 数组（含 IPv6）
     int socks5_bind_port = 11080;
+    int redirect_port = 53080; // 共享配置；linux_network / multilink TCP REDIRECT 本地端口
+    // redirect 监听地址；省略则回退到 socks5_bind_ip（与 multilink 一致）。
+    // 承接网关 REDIRECT 时用 ["::","0.0.0.0"]；仅本机 divert 可用 ["::1","127.0.0.1"]。
+    std::string redirect_bind_ip;
+    std::vector<std::string> redirect_bind_ips;
     int listen_backlog = 128;
+
+    std::vector<std::string> redirect_listen_ips() const {
+        if (!redirect_bind_ips.empty()) return redirect_bind_ips;
+        if (!redirect_bind_ip.empty()) return {redirect_bind_ip};
+        if (!socks5_bind_ips.empty()) return socks5_bind_ips;
+        return {socks5_bind_ip};
+    }
     std::map<std::string, LinkEndpoint> links;
     std::string default_link; // first declared link name
     std::string rules_path = "config/multirules.yaml";
@@ -845,13 +857,21 @@ inline MultilinkConfig MultilinkConfig::load(const std::string& path) {
 
     MultilinkConfig c;
     c.socks5_bind_ips = parse_ip_list_field(text, "socks5_bind_ip");
-    c.socks5_bind_ip = get_string_in(text, "socks5_bind_ip", c.socks5_bind_ip);
-    finalize_bind_ips(c.socks5_bind_ips, c.socks5_bind_ip); // 归一化处理
+    if (c.socks5_bind_ips.empty()) {
+        c.socks5_bind_ip = get_string_in(text, "socks5_bind_ip", c.socks5_bind_ip);
+    }
+    finalize_bind_ips(c.socks5_bind_ips, c.socks5_bind_ip);
 
     c.socks5_bind_port = get_int_in(text, "socks5_bind_port", c.socks5_bind_port);
-    c.socks5_bind_ip = get_string_in(text, "socks5_bind_ip", c.socks5_bind_ip);
-    normalize_host_ip(c.socks5_bind_ip);
-    c.socks5_bind_port = get_int_in(text, "socks5_bind_port", c.socks5_bind_port);
+    c.redirect_port = get_int_in(text, "redirect_port", c.redirect_port);
+    if (c.redirect_port <= 0 || c.redirect_port > 65535) c.redirect_port = 53080;
+    c.redirect_bind_ips = parse_ip_list_field(text, "redirect_bind_ip");
+    if (c.redirect_bind_ips.empty()) {
+        c.redirect_bind_ip = get_string_in(text, "redirect_bind_ip", c.redirect_bind_ip);
+    }
+    if (!c.redirect_bind_ips.empty() || !c.redirect_bind_ip.empty()) {
+        finalize_bind_ips(c.redirect_bind_ips, c.redirect_bind_ip);
+    }
     c.listen_backlog = get_int_in(text, "listen_backlog", c.listen_backlog);
     c.rules_path = get_string_in(text, "rules_path", c.rules_path);
     c.geoip_cn = get_string_in(text, "geoip_cn", c.geoip_cn);
@@ -896,6 +916,126 @@ struct InternetConfig {
         if (c.divert_idle_timeout_sec < 1) c.divert_idle_timeout_sec = 180;
         if (c.max_connections < 1) c.max_connections = 2048;
         if (c.max_dns_inflight < 1) c.max_dns_inflight = 64;
+        return c;
+    }
+};
+
+// Wired LAN gateway → local redirect_port (see src/linux_gate.cpp).
+// Does not modify wan_iface addresses / default route / host DNS.
+struct LinuxGateConfig {
+    std::string lan_iface = "enp3s0";
+    std::string wan_iface = "wlo1"; // read-only: detect IPv6 prefix; never reconfigured
+    std::string lan_ipv4 = "192.168.137.1";
+    int lan_ipv4_prefix = 24;
+    std::string dhcpv4_start = "192.168.137.100";
+    std::string dhcpv4_end = "192.168.137.200";
+    std::string dhcp_lease = "12h";
+    bool ipv6_enable = true;
+    std::string lan_ipv6_ula = "fd00:56::1"; // fallback when wan has no GUA /64
+    int lan_ipv6_prefix = 64;
+    int redirect_port = 53080;
+    std::string redirect_host_v4 = "127.0.0.1";
+    std::string redirect_host_v6 = "::1";
+    std::string socks5_host_v4 = "127.0.0.1";
+    std::string socks5_host_v6 = "::1";
+    int socks5_port = 1080;
+    // Client UDP/53 → linux_network sticky DNS (real A/AAAA + IP→name learn; no Fake-IP).
+    // Default 53053 matches linux_network kDnsListenPort. 0 = gate SOCKS5 DoT stub (no learn).
+    std::string dns_redirect_host_v4 = "127.0.0.1";
+    int dns_redirect_port = 53053;
+    int dns_udp_port = 53; // local UDP listen for IPv6→sticky forward / SOCKS stub
+    int icmp_queue_num = 21571; // distinct from linux_network OUTPUT queue
+    bool enable_dhcp = true;
+    bool log = true;
+
+    // Prefer IPv4 loopback SOCKS, then IPv6 (multilink dual bind).
+    std::vector<std::string> socks5_hosts() const {
+        std::vector<std::string> out;
+        if (!socks5_host_v4.empty()) out.push_back(socks5_host_v4);
+        if (!socks5_host_v6.empty() && socks5_host_v6 != socks5_host_v4) {
+            out.push_back(socks5_host_v6);
+        }
+        if (out.empty()) out.push_back("127.0.0.1");
+        return out;
+    }
+
+    static LinuxGateConfig load(const std::string& path) {
+        LinuxGateConfig c;
+        JsonConfig j(path);
+        c.lan_iface = j.get_string("lan_iface", c.lan_iface);
+        c.wan_iface = j.get_string("wan_iface", c.wan_iface);
+        c.lan_ipv4 = j.get_string("lan_ipv4", c.lan_ipv4);
+        c.lan_ipv4_prefix = j.get_int("lan_ipv4_prefix", c.lan_ipv4_prefix);
+        c.dhcpv4_start = j.get_string("dhcpv4_start", c.dhcpv4_start);
+        c.dhcpv4_end = j.get_string("dhcpv4_end", c.dhcpv4_end);
+        c.dhcp_lease = j.get_string("dhcp_lease", c.dhcp_lease);
+        c.ipv6_enable = j.get_bool("ipv6_enable", c.ipv6_enable);
+        c.lan_ipv6_ula = j.get_string("lan_ipv6_ula", c.lan_ipv6_ula);
+        c.lan_ipv6_prefix = j.get_int("lan_ipv6_prefix", c.lan_ipv6_prefix);
+        c.redirect_port = j.get_int("redirect_port", c.redirect_port);
+        c.redirect_host_v4 = j.get_string("redirect_host_v4", c.redirect_host_v4);
+        c.redirect_host_v6 = j.get_string("redirect_host_v6", c.redirect_host_v6);
+        // Preferred: socks5_host_v4 / socks5_host_v6
+        // Compat: socks5_host, or multilink socks5_bind_ip / socks5_bind_port
+        c.socks5_host_v4 = j.get_string("socks5_host_v4", "");
+        c.socks5_host_v6 = j.get_string("socks5_host_v6", "");
+        const std::string legacy = j.get_string("socks5_host", "");
+        auto looks_v6 = [](const std::string& h) {
+            return h.find(':') != std::string::npos || h == "*" || h.empty();
+        };
+        if (c.socks5_host_v4.empty() && c.socks5_host_v6.empty()) {
+            if (!legacy.empty() && legacy.front() != '[') {
+                if (looks_v6(legacy)) c.socks5_host_v6 = legacy;
+                else c.socks5_host_v4 = legacy;
+            } else {
+                const std::string bind = j.get_string("socks5_bind_ip", "");
+                if (!bind.empty() && bind.front() != '[') {
+                    if (looks_v6(bind)) c.socks5_host_v6 = bind;
+                    else c.socks5_host_v4 = bind;
+                }
+            }
+        }
+        if (c.socks5_host_v4.empty() && !legacy.empty() && !looks_v6(legacy) &&
+            legacy.front() != '[') {
+            c.socks5_host_v4 = legacy;
+        }
+        if (c.socks5_host_v4.empty()) c.socks5_host_v4 = "127.0.0.1";
+        if (c.socks5_host_v6.empty()) c.socks5_host_v6 = "::1";
+        c.socks5_port = j.get_int("socks5_port", 0);
+        if (c.socks5_port <= 0) {
+            c.socks5_port = j.get_int("socks5_bind_port", 1080);
+        }
+        c.dns_redirect_host_v4 =
+            j.get_string("dns_redirect_host_v4", c.dns_redirect_host_v4);
+        c.dns_redirect_port = j.get_int("dns_redirect_port", c.dns_redirect_port);
+        c.dns_udp_port = j.get_int("dns_udp_port", c.dns_udp_port);
+        c.icmp_queue_num = j.get_int("icmp_queue_num", c.icmp_queue_num);
+        c.enable_dhcp = j.get_bool("enable_dhcp", c.enable_dhcp);
+        c.log = j.get_bool("log", c.log);
+        if (c.lan_ipv4_prefix < 8 || c.lan_ipv4_prefix > 30) c.lan_ipv4_prefix = 24;
+        if (c.lan_ipv6_prefix < 48 || c.lan_ipv6_prefix > 64) c.lan_ipv6_prefix = 64;
+        if (c.redirect_port <= 0 || c.redirect_port > 65535) {
+            throw std::runtime_error("redirect_port out of range (1..65535): " +
+                                     std::to_string(c.redirect_port));
+        }
+        if (c.socks5_port <= 0 || c.socks5_port > 65535) {
+            throw std::runtime_error("socks5_port out of range (1..65535): " +
+                                     std::to_string(c.socks5_port) +
+                                     " (typo? valid e.g. 1080 / 11080 / 11081)");
+        }
+        if (c.dns_redirect_port < 0 || c.dns_redirect_port > 65535) {
+            throw std::runtime_error("dns_redirect_port out of range (0..65535)");
+        }
+        if (c.dns_udp_port <= 0 || c.dns_udp_port > 65535) {
+            throw std::runtime_error("dns_udp_port out of range (1..65535): " +
+                                     std::to_string(c.dns_udp_port));
+        }
+        normalize_host_ip(c.redirect_host_v4);
+        normalize_host_ip(c.redirect_host_v6);
+        normalize_host_ip(c.socks5_host_v4);
+        normalize_host_ip(c.socks5_host_v6);
+        normalize_host_ip(c.dns_redirect_host_v4);
+        normalize_host_ip(c.lan_ipv6_ula);
         return c;
     }
 };

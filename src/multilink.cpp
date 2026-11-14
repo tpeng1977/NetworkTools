@@ -20,6 +20,17 @@
 #  include <iphlpapi.h>
 #endif
 
+#ifdef __linux__
+#  include <linux/netfilter_ipv4.h>
+#  include <netinet/in.h>
+#  ifndef IP6T_SO_ORIGINAL_DST
+#    define IP6T_SO_ORIGINAL_DST 80
+#  endif
+#  ifndef IPV6_TRANSPARENT
+#    define IPV6_TRANSPARENT 75
+#  endif
+#endif
+
 namespace {
 
 std::atomic<bool> g_running{true};
@@ -562,7 +573,70 @@ bool open_direct(std::shared_ptr<Session> s, const SocksTarget& t) {
     return true;
 }
 
-void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
+SocksTarget make_target_ipv4(uint32_t ip_net, uint16_t port) {
+    SocksTarget t;
+    t.atyp = vortex::ATYP_IPV4;
+    t.port = port;
+    t.has_ipv4 = true;
+    t.ipv4_host = ntohl(ip_net);
+    char buf[INET_ADDRSTRLEN] = {};
+    in_addr a{};
+    a.s_addr = ip_net;
+    inet_ntop(AF_INET, &a, buf, sizeof(buf));
+    t.host = buf;
+    t.wire.clear();
+    t.wire.push_back(vortex::ATYP_IPV4);
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(&ip_net);
+    t.wire.insert(t.wire.end(), raw, raw + 4);
+    t.wire.push_back(static_cast<uint8_t>(port >> 8));
+    t.wire.push_back(static_cast<uint8_t>(port & 0xFF));
+    return t;
+}
+
+SocksTarget make_target_ipv6(const in6_addr& addr, uint16_t port) {
+    SocksTarget t;
+    t.atyp = vortex::ATYP_IPV6;
+    t.port = port;
+    char buf[INET6_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET6, &addr, buf, sizeof(buf));
+    t.host = buf;
+    t.wire.clear();
+    t.wire.push_back(vortex::ATYP_IPV6);
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(&addr);
+    t.wire.insert(t.wire.end(), raw, raw + 16);
+    t.wire.push_back(static_cast<uint8_t>(port >> 8));
+    t.wire.push_back(static_cast<uint8_t>(port & 0xFF));
+    return t;
+}
+
+bool read_redirect_target(socket_t local_fd, bool is_v6, SocksTarget& out) {
+#ifdef __linux__
+    if (is_v6) {
+        sockaddr_in6 orig6{};
+        socklen_t olen = sizeof(orig6);
+        if (getsockopt(local_fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, &orig6, &olen) != 0) {
+            return false;
+        }
+        out = make_target_ipv6(orig6.sin6_addr, ntohs(orig6.sin6_port));
+        return true;
+    }
+    sockaddr_in orig{};
+    socklen_t olen = sizeof(orig);
+    if (getsockopt(local_fd, SOL_IP, SO_ORIGINAL_DST, &orig, &olen) != 0) {
+        return false;
+    }
+    out = make_target_ipv4(orig.sin_addr.s_addr, ntohs(orig.sin_port));
+    return true;
+#else
+    (void)local_fd;
+    (void)is_v6;
+    (void)out;
+    return false;
+#endif
+}
+
+void serve_stream_target(socket_t local_fd, MultilinkConfig cfg, SocksTarget target,
+                         bool socks_reply) {
     auto s = std::make_shared<Session>();
     s->local_fd = local_fd;
     s->idle_timeout_sec = 300;
@@ -570,16 +644,6 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
         s->idle_timeout_sec = cfg.links.begin()->second.idle_timeout_sec;
     }
     set_socket_options(local_fd, s->idle_timeout_sec);
-
-    SocksTarget target;
-    if (!socks5_read_target(local_fd, target)) return;
-
-    // Hotspot DNS arrives as TCP/53 to 1.1.1.1. Route by the queried name,
-    // not by the resolver address.
-    if (target.port == 53) {
-        handle_dns(s, target, cfg);
-        return;
-    }
 
     // Prefer a learned domain over a (possibly poisoned) literal IP for rules.
     std::string rule_host = target.host;
@@ -600,18 +664,19 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
     std::string link_err;
     if (!select_link(cfg, decision, link, link_err)) {
         if (cfg.log_decisions) {
-            log_line(std::string("[-] ") + link_err + " for " + target.host + ":" +
-                     std::to_string(target.port));
+            log_line(std::string("[-] ") + link_err + " for " +
+                     format_host_port(target.host, target.port));
         }
-        reply_socks_fail(local_fd, 0x01);
+        if (socks_reply) reply_socks_fail(local_fd, 0x01);
         return;
     }
     s->link = link;
     if (!link.name.empty()) s->idle_timeout_sec = link.idle_timeout_sec;
 
     if (cfg.log_decisions) {
-        log_line(std::string("[*] ") + rules::decision_name(decision) + " " +
-                 rule_host + ":" + std::to_string(target.port) +
+        log_line(std::string(socks_reply ? "[*] " : "[*] REDIR ") +
+                 rules::decision_name(decision) + " " +
+                 format_host_port(rule_host, target.port) +
                  "  (" + decision.matched + ")" +
                  (link.name.empty()
                       ? ""
@@ -624,7 +689,7 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
     if (decision.action == rules::Action::Direct) {
         ok = open_direct(s, target);
         if (!ok) {
-            reply_socks_fail(local_fd, 0x05);
+            if (socks_reply) reply_socks_fail(local_fd, 0x05);
             return;
         }
     } else {
@@ -635,12 +700,12 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
         }
         ok = open_proxy(s, connect_tgt);
         if (!ok) {
-            reply_socks_fail(local_fd, 0x01);
+            if (socks_reply) reply_socks_fail(local_fd, 0x01);
             return;
         }
     }
 
-    if (!reply_socks_ok(local_fd)) return;
+    if (socks_reply && !reply_socks_ok(local_fd)) return;
 
     if (s->via_proxy) {
         std::thread(relay_proxy_down, s).detach();
@@ -664,6 +729,43 @@ void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
 
     shutdown_both(local_fd);
     shutdown_both(s->remote_fd);
+}
+
+void handle_socks5(socket_t local_fd, MultilinkConfig cfg) {
+    int idle = 300;
+    if (!cfg.links.empty()) idle = cfg.links.begin()->second.idle_timeout_sec;
+    set_socket_options(local_fd, idle);
+
+    SocksTarget target;
+    if (!socks5_read_target(local_fd, target)) return;
+
+    // Hotspot DNS arrives as TCP/53 to 1.1.1.1. Route by the queried name,
+    // not by the resolver address.
+    if (target.port == 53) {
+        auto s = std::make_shared<Session>();
+        s->local_fd = local_fd;
+        s->idle_timeout_sec = idle;
+        handle_dns(s, target, cfg);
+        return;
+    }
+
+    serve_stream_target(local_fd, std::move(cfg), std::move(target), /*socks_reply=*/true);
+}
+
+void handle_redirect(socket_t local_fd, MultilinkConfig cfg, bool is_v6) {
+    SocksTarget target;
+    if (!read_redirect_target(local_fd, is_v6, target)) {
+        net_close(local_fd);
+        return;
+    }
+    serve_stream_target(local_fd, std::move(cfg), std::move(target), /*socks_reply=*/false);
+}
+
+bool listen_is_ipv6(socket_t fd) {
+    sockaddr_storage ss{};
+    socklen_t len = sizeof(ss);
+    if (getsockname(fd, reinterpret_cast<sockaddr*>(&ss), &len) != 0) return false;
+    return ss.ss_family == AF_INET6;
 }
 
 } // namespace
@@ -693,25 +795,82 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    // 【修改点】支持同时绑定多个 socks5_bind_ips
+    // 多地址绑定：支持 IPv4 / IPv6 字面量与 "::"/"*" 通配；与 server / linux_network
+    // 一致，多绑定时若同时有 IPv4 companion，通配 "::" 使用 V6ONLY=1。
+    const auto& bind_ips = cfg.socks5_bind_ips.empty()
+        ? std::vector<std::string>{cfg.socks5_bind_ip}
+        : cfg.socks5_bind_ips;
+    bool has_v4_companion = false;
+    for (const auto& h : bind_ips) {
+        if (h == "0.0.0.0" || host_is_ipv4_literal(h)) {
+            has_v4_companion = true;
+            break;
+        }
+    }
+    const bool multi = bind_ips.size() > 1;
+
     std::vector<socket_t> listen_fds;
-    for (const auto& bind_ip : cfg.socks5_bind_ips) {
+    for (const auto& bind_ip : bind_ips) {
+        const bool is_wild = bind_ip.empty() || bind_ip == "*" || bind_ip == "::";
+        const bool prefer_dual = is_wild && !(multi && has_v4_companion);
         socket_t listen_fd = create_listen_socket(
-            bind_ip, cfg.socks5_bind_port, cfg.listen_backlog);
+            bind_ip, cfg.socks5_bind_port, cfg.listen_backlog, prefer_dual);
         if (listen_fd == INVALID_SOCK) {
             std::cerr << "[-] Failed to bind SOCKS5 "
-                      << bind_ip << ":" << cfg.socks5_bind_port << "\n";
+                      << format_host_port(bind_ip, cfg.socks5_bind_port) << "\n";
             continue;
         }
         listen_fds.push_back(listen_fd);
         std::cout << "[*] MultiLink SOCKS5 on "
-                  << format_host_port(bind_ip, cfg.socks5_bind_port) << std::endl;
+                  << format_host_port(bind_ip, cfg.socks5_bind_port);
+        if (prefer_dual) std::cout << " (dual-stack IPv4+IPv6)";
+        else if (is_wild && !prefer_dual) std::cout << " (IPv6-only; companion IPv4 bind)";
+        std::cout << std::endl;
     }
 
     if (listen_fds.empty()) {
         std::cerr << "[-] Failed to bind any SOCKS5 address\n";
         net_cleanup();
         return 1;
+    }
+
+    // redirect_port：绑定 redirect_bind_ip（缺省回退 socks5_bind_ip）。
+    std::vector<socket_t> redirect_fds;
+    std::vector<bool> redirect_is_v6;
+    if (cfg.redirect_port > 0 && cfg.redirect_port != cfg.socks5_bind_port) {
+        const auto redir_ips = cfg.redirect_listen_ips();
+        bool redir_has_v4 = false;
+        for (const auto& h : redir_ips) {
+            if (h == "0.0.0.0" || host_is_ipv4_literal(h)) {
+                redir_has_v4 = true;
+                break;
+            }
+        }
+        const bool redir_multi = redir_ips.size() > 1;
+        for (const auto& bind_ip : redir_ips) {
+            const bool is_wild = bind_ip.empty() || bind_ip == "*" || bind_ip == "::";
+            const bool prefer_dual = is_wild && !(redir_multi && redir_has_v4);
+            socket_t fd = create_listen_socket(
+                bind_ip, cfg.redirect_port, cfg.listen_backlog, prefer_dual);
+            if (fd == INVALID_SOCK) {
+                std::cerr << "[-] Failed to bind redirect "
+                          << format_host_port(bind_ip, cfg.redirect_port) << "\n";
+                continue;
+            }
+            redirect_fds.push_back(fd);
+            redirect_is_v6.push_back(listen_is_ipv6(fd));
+            std::cout << "[*] MultiLink redirect on "
+                      << format_host_port(bind_ip, cfg.redirect_port);
+            if (prefer_dual) std::cout << " (dual-stack IPv4+IPv6)";
+            else if (is_wild && !prefer_dual) std::cout << " (IPv6-only; companion IPv4 bind)";
+            std::cout << std::endl;
+        }
+        if (redirect_fds.empty()) {
+            std::cerr << "[-] Failed to bind any redirect_port address\n";
+        }
+    } else if (cfg.redirect_port == cfg.socks5_bind_port) {
+        std::cerr << "[-] redirect_port equals socks5_bind_port (" << cfg.redirect_port
+                  << "); skip redirect listeners\n";
     }
 
     for (const auto& kv : cfg.links) {
@@ -731,7 +890,6 @@ int main(int argc, char* argv[]) {
               << std::endl;
     std::cout.flush();
 
-    // 【修改点】为每一个监听 socket 启动一个接受连接的线程
     std::vector<std::thread> accept_threads;
     for (socket_t listen_fd : listen_fds) {
         accept_threads.emplace_back([listen_fd, cfg]() {
@@ -745,6 +903,20 @@ int main(int argc, char* argv[]) {
             }
         });
     }
+    for (size_t i = 0; i < redirect_fds.size(); ++i) {
+        const socket_t listen_fd = redirect_fds[i];
+        const bool is_v6 = redirect_is_v6[i];
+        accept_threads.emplace_back([listen_fd, cfg, is_v6]() {
+            while (g_running) {
+                socket_t local_fd = accept_any(listen_fd);
+                if (local_fd == INVALID_SOCK) {
+                    if (!g_running) break;
+                    continue;
+                }
+                std::thread(handle_redirect, local_fd, cfg, is_v6).detach();
+            }
+        });
+    }
 
     // 主线程等待退出信号
     while (g_running) {
@@ -753,6 +925,9 @@ int main(int argc, char* argv[]) {
 
     // 清理监听套接字
     for (socket_t listen_fd : listen_fds) {
+        net_close(listen_fd);
+    }
+    for (socket_t listen_fd : redirect_fds) {
         net_close(listen_fd);
     }
 
